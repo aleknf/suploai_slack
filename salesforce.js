@@ -235,6 +235,97 @@ async function getActivityHistory(recordId, limit = 20) {
   };
 }
 
+/**
+ * Fetches the full details of a Salesforce Case record by its Id.
+ * Returns key fields: CaseNumber, Subject, Status, Priority, Description,
+ * Account, Contact, Owner, and timestamps.
+ *
+ * @param {string} caseId - 15 or 18-character Salesforce Case record Id
+ * @returns {Promise<Object>} The Case record data
+ * @throws {Error} If the record is not found or access is denied
+ */
+async function getCaseDetails(caseId) {
+  const fields = [
+    'Id', 'CaseNumber', 'Subject', 'Status', 'Priority', 'Origin',
+    'Description', 'Resolution__c',
+    'AccountId', 'Account.Name',
+    'ContactId', 'Contact.Name', 'Contact.Email',
+    'OwnerId', 'Owner.Name',
+    'CreatedDate', 'LastModifiedDate', 'ClosedDate',
+    'IsEscalated', 'Type', 'Reason',
+  ];
+
+  const soql = `SELECT ${fields.join(', ')} FROM Case WHERE Id = '${caseId}' LIMIT 1`;
+  const token = await getSalesforceToken();
+  const url = `${sfUrl}/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(soql)}`;
+
+  const response = await fetch(url, { headers: buildHeaders(token) });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Get case failed for ${caseId}: ${errorText}`);
+  }
+
+  const data = await response.json();
+
+  if (!data.records || data.records.length === 0) {
+    throw new Error(`Case not found: ${caseId}`);
+  }
+
+  return data.records[0];
+}
+
+/**
+ * Queries Salesforce Case records with optional filters.
+ * Builds a dynamic SOQL query based on the provided filter options.
+ *
+ * @param {Object} options - Filter options
+ * @param {string} [options.status] - Filter by case status (e.g. "New", "Closed")
+ * @param {string} [options.priority] - Filter by priority (e.g. "High", "Low")
+ * @param {string} [options.accountName] - Filter by account name (partial match)
+ * @param {string} [options.contactName] - Filter by contact name (partial match)
+ * @param {string} [options.subjectKeyword] - Filter by keyword in subject
+ * @param {number} [options.limit=10] - Max records to return
+ * @returns {Promise<Object>} Object with totalSize and records array
+ * @throws {Error} If the query fails
+ */
+async function queryCases({ status, priority, accountName, contactName, subjectKeyword, limit = 10 } = {}) {
+  const conditions = [];
+
+  if (status) conditions.push(`Status = '${status}'`);
+  if (priority) conditions.push(`Priority = '${priority}'`);
+  if (accountName) conditions.push(`Account.Name LIKE '%${accountName}%'`);
+  if (contactName) conditions.push(`Contact.Name LIKE '%${contactName}%'`);
+  if (subjectKeyword) conditions.push(`Subject LIKE '%${subjectKeyword}%'`);
+
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  const soql = `
+    SELECT Id, CaseNumber, Subject, Status, Priority, Origin, Type,
+           Account.Name, Contact.Name, Owner.Name, CreatedDate, IsEscalated
+    FROM Case
+    ${whereClause}
+    ORDER BY CreatedDate DESC
+    LIMIT ${limit}
+  `;
+
+  const token = await getSalesforceToken();
+  const url = `${sfUrl}/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(soql)}`;
+
+  const response = await fetch(url, { headers: buildHeaders(token) });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Case query failed: ${errorText}`);
+  }
+
+  const data = await response.json();
+  return {
+    totalSize: data.totalSize,
+    records: data.records,
+  };
+}
+
 module.exports = {
   getSalesforceToken,
   describeObject,
@@ -242,4 +333,6 @@ module.exports = {
   runSOSL,
   getRecord,
   getActivityHistory,
+  getCaseDetails,
+  queryCases,
 };
