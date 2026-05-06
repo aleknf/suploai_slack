@@ -64,6 +64,60 @@ function getTimestampForTime(hours, minutes) {
 }
 
 /**
+ * Converts markdown-formatted text from OpenAI into Slack mrkdwn format.
+ * Slack does not support standard markdown — it uses its own syntax.
+ *
+ * Conversions:
+ *   **bold**        → *bold*
+ *   __bold__        → *bold*
+ *   *italic*        → _italic_   (single asterisk)
+ *   _italic_        → _italic_   (already correct)
+ *   `code`          → `code`     (already correct)
+ *   ```block```     → ```block``` (already correct)
+ *   ### Heading     → *Heading*  (Slack has no headings, use bold)
+ *   ## Heading      → *Heading*
+ *   # Heading       → *Heading*
+ *   - item / * item → • item     (bullet list)
+ *   [text](url)     → <url|text> (Slack link format)
+ *
+ * @param {string} text - Markdown text from OpenAI
+ * @returns {string} Slack mrkdwn formatted text
+ */
+function mdToSlack(text) {
+  if (!text) return text;
+
+  return text
+    // Preserve code blocks first (avoid mangling content inside them)
+    // We'll do a two-pass: extract code blocks, convert rest, then restore
+    .replace(/```([\s\S]*?)```/g, (_, code) => `\`\`\`${code}\`\`\``) // keep as-is
+
+    // Headings → bold line
+    .replace(/^#{1,6}\s+(.+)$/gm, '*$1*')
+
+    // Bold: **text** or __text__ → *text*
+    .replace(/\*\*(.+?)\*\*/g, '*$1*')
+    .replace(/__(.+?)__/g, '*$1*')
+
+    // Italic: *text* (single) → _text_  (only if not already converted from bold)
+    // Use a negative lookbehind/ahead to avoid touching already-converted *bold*
+    .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '_$1_')
+
+    // Markdown links: [text](url) → <url|text>
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<$2|$1>')
+
+    // Unordered list items: "- item" or "* item" at line start → "• item"
+    .replace(/^[ \t]*[-*]\s+/gm, '• ')
+
+    // Ordered list: "1. item" → keep as-is (Slack doesn't have ordered lists)
+
+    // Horizontal rules → blank line
+    .replace(/^[-*_]{3,}$/gm, '')
+
+    // Trim trailing whitespace per line
+    .replace(/[ \t]+$/gm, '');
+}
+
+/**
  * Runs an OpenAI chat completion with Salesforce tool support.
  *
  * This is the core AI loop used by both the Assistant DM thread and the @mention handler.
@@ -97,7 +151,7 @@ async function runWithTools(messages, { maxIterations = 5 } = {}) {
 
     // If the model chose to respond directly (no tool calls), return the text
     if (choice.finish_reason === 'stop' || !choice.message.tool_calls) {
-      return choice.message.content;
+      return mdToSlack(choice.message.content);
     }
 
     // Append the assistant's tool-calling message to the conversation history
@@ -135,7 +189,7 @@ async function runWithTools(messages, { maxIterations = 5 } = {}) {
  * Keep this concise — it is prepended to every message array and counts toward token usage.
  */
 const DEFAULT_SYSTEM_CONTENT = `You are Suplo, an assistant in a Slack workspace for Langit Kreasi Solusindo (LKS).
-You help users with general questions AND with querying Salesforce data (Contacts, Leads, Opportunities, Activities, Projects, and more).
+You help users with general questions AND with querying Salesforce data (Contacts, Leads, Opportunities, Activities, Projects, Cases, and more).
 
 When a user asks about Salesforce records:
 - If they do not specify which object (e.g. Contact vs Lead), ask them first before searching.
@@ -143,11 +197,15 @@ When a user asks about Salesforce records:
 - Use search_records for keyword searches; use query_records for structured filters.
 - Present results clearly and concisely — avoid dumping raw JSON.
 
-General rules:
-- Respond professionally unless asked otherwise.
-- Convert markdown to Slack-compatible formatting.
-- Keep Slack syntax like <@USER_ID> or <#CHANNEL_ID> as-is in your responses.
-- Avoid greetings unless explicitly requested.`;
+Formatting rules (IMPORTANT — you are responding in Slack):
+- Use *bold* for emphasis (NOT **double asterisk**).
+- Use _italic_ for secondary info.
+- Use bullet points with • or - for lists.
+- Do NOT use markdown headings (# ## ###) — use *bold text* instead.
+- Do NOT use [text](url) links — use plain URLs or <url|text> format.
+- Keep Slack syntax like <@USER_ID> or <#CHANNEL_ID> as-is.
+- Avoid greetings unless explicitly requested.
+- Respond professionally unless asked otherwise.`;
 
 // Assistant configuration and event handlers
 const assistant = new Assistant({
