@@ -188,7 +188,7 @@ async function runWithTools(messages, { maxIterations = 5 } = {}) {
  * Instructs the AI on its persona, capabilities, and tool usage rules.
  * Keep this concise — it is prepended to every message array and counts toward token usage.
  */
-const DEFAULT_SYSTEM_CONTENT = `You are Suplo, an assistant in a Slack workspace for Langit Kreasi Solusindo (LKS).
+const DEFAULT_SYSTEM_CONTENT = `You are Lori, an assistant in a Slack workspace for Langit Kreasi Solusindo (LKS).
 You help users with general questions AND with querying Salesforce data (Contacts, Leads, Opportunities, Activities, Projects, Cases, and more).
 
 When a user asks about Salesforce records:
@@ -213,7 +213,7 @@ const assistant = new Assistant({
     const { context } = event.assistant_thread;
 
     try {
-      await say('Hi, how can Suplo help?');
+      await say('Hi, how can Lori help?');
       await saveThreadContext();
 
       const prompts = [
@@ -257,7 +257,7 @@ const assistant = new Assistant({
       //add identity check
       const identityQuestions = ['who are you', 'siapa kamu','what is your name', 'what is your identity', 'what are you?'];
       if (identityQuestions.some(q => message.text.toLowerCase().includes(q))) {
-        await say("I'm Suplo, LKS Assistant (Idiot) ready to serve all LKS Members. Suplo is The Man, The Myth, The LEGEND!!");
+        await say("I'm Lori, LKS Assistant ready to serve all LKS Members. Lori is The Man, The Myth, The LEGEND!!");
         return;
 
       }
@@ -269,7 +269,7 @@ const assistant = new Assistant({
 
       // Filter out the initial greeting and keep only the last 10 messages for context
       const threadHistory = thread.messages
-        .filter(m => m.text !== 'Hi, sorry Suplo lagi ngehang....')
+        .filter(m => m.text !== 'Hi, sorry Lori lagi ngehang....')
         .slice(-10)
         .map(m => ({
           role: m.bot_id ? 'assistant' : 'user',
@@ -298,9 +298,9 @@ app.assistant(assistant);
 (async () => {
   try {
     await app.start();
-    app.logger.info('⚡️ Suplo app is running!');
+    app.logger.info('⚡️ Lori app is running!');
   } catch (error) {
-    app.logger.error('Failed to start Suplo', error);
+    app.logger.error('Failed to start Lori', error);
   }
 })();
 

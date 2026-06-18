@@ -1,9 +1,9 @@
 {
   "display_information": {
-    "name": "Suplo_AI Assistant Idiot ",
+    "name": "Lori_AI Assistant  ",
     "description": "You Helpful Assistant",
     "background_color": "#59592c",
-    "long_description": "Suplo is AI Assistant, the myth and the legend. Suplo is made by human just like you so it can still make mistakes. Use Suplo as your helpful companion not as your source of truth :p"
+    "long_description": "Lori is AI Assistant, the myth and the legend. Lori is made by human just like you so it can still make mistakes. Use Lori as your helpful companion not as your source of truth :p"
   },
   "features": {
     "app_home": {
@@ -12,11 +12,11 @@
       "messages_tab_read_only_enabled": false
     },
     "bot_user": {
-      "display_name": "Suplo_AI Assistant Idiot",
+      "display_name": "Lori_AI Assistant",
       "always_online": false
     },
     "assistant_view": {
-      "assistant_description": "Suplo_AI means Assitant Idiot not Intelligent, at your service!",
+      "assistant_description": "Lori_AI means Assitant at your service!",
       "suggested_prompts": []
     },
      
