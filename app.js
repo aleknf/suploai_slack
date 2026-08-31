@@ -39,7 +39,8 @@ const openai = new OpenAI({
 const userClient = new WebClient(process.env.SLACK_USER_TOKEN);
 
 const formatTimestamp = (timestamp) => {
-  const date = new Date((timestamp + 7 * 60 * 60) * 1000); // Adjust for timezone
+  //const date = new Date((timestamp + 7 * 60 * 60) * 1000); // Adjust for timezone
+  const date = new Date(timestamp * 1000);
   const day = String(date.getDate()).padStart(2, "0");
   const month = String(date.getMonth() + 1).padStart(2, "0"); // Months are zero-based
   const year = date.getFullYear();
