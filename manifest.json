@@ -1,71 +1,127 @@
 {
-  "display_information": {
-    "name": "Lori_AI Assistant  ",
-    "description": "You Helpful Assistant",
-    "background_color": "#59592c",
-    "long_description": "Lori is AI Assistant, the myth and the legend. Lori is made by human just like you so it can still make mistakes. Use Lori as your helpful companion not as your source of truth :p"
-  },
-  "features": {
-    "app_home": {
-      "home_tab_enabled": false,
-      "messages_tab_enabled": true,
-      "messages_tab_read_only_enabled": false
+    "display_information": {
+        "name": "Lori AI",
+        "description": "LangitKreasi Orchestrated Reasoning Intelligence",
+        "background_color": "#004492",
+        "long_description": "LangitKreasi Orchestrated Reasoning Intelligence (LORI). Turn your existing CRM, collaboration, and operational data into answers, alerts, and recommended actions — without forcing clients into a new AI license stack"
     },
-    "bot_user": {
-      "display_name": "Lori_AI Assistant",
-      "always_online": false
+    "features": {
+        "app_home": {
+            "home_tab_enabled": false,
+            "messages_tab_enabled": true,
+            "messages_tab_read_only_enabled": false
+        },
+        "bot_user": {
+            "display_name": "Lori AI",
+            "always_online": true
+        },
+        "slash_commands": [
+            {
+                "command": "/set-model",
+                "description": "Set your preferred AI model (openai or deepseek)",
+                "usage_hint": "[openai|deepseek]",
+                "should_escape": false
+            },
+            {
+                "command": "/current-model",
+                "description": "Check which AI model is currently active",
+                "should_escape": false
+            },
+            {
+                "command": "/timesheet-lks",
+                "description": "time sheet submit",
+                "usage_hint": "Use this to submit your timesheet",
+                "should_escape": false
+            },
+            {
+                "command": "/leaverequest-lks",
+                "description": "leave submit",
+                "usage_hint": "Use this to submit your leave request",
+                "should_escape": false
+            }
+        ],
+        "assistant_view": {
+            "assistant_description": "Lori, LangitKreasi Orchestrated Reasoning Intelligence.",
+            "suggested_prompts": []
+        }
     },
-    "assistant_view": {
-      "assistant_description": "Lori_AI means Assitant at your service!",
-      "suggested_prompts": []
+    "oauth_config": {
+        "scopes": {
+            "user": [
+                "users.profile:read",
+                "canvases:read",
+                "canvases:write",
+                "channels:history",
+                "channels:read",
+                "channels:write",
+                "chat:write",
+                "emoji:read",
+                "files:read",
+                "groups:history",
+                "groups:read",
+                "groups:write",
+                "im:history",
+                "im:write",
+                "mpim:history",
+                "mpim:read",
+                "mpim:write",
+                "reactions:read",
+                "reactions:write",
+                "search:read.files",
+                "search:read.im",
+                "search:read.mpim",
+                "search:read.private",
+                "search:read.public",
+                "search:read.users",
+                "users.profile:write",
+                "users:read",
+                "users:read.email"
+            ],
+            "user_optional": [
+                "search:read.private",
+                "search:read.mpim",
+                "search:read.im",
+                "search:read.files",
+                "chat:write",
+                "groups:history",
+                "mpim:history",
+                "im:history",
+                "canvases:read",
+                "canvases:write"
+            ],
+            "bot": [
+                "app_mentions:read",
+                "assistant:write",
+                "canvases:write",
+                "channels:history",
+                "chat:write",
+                "commands",
+                "files:read",
+                "groups:history",
+                "im:history",
+                "im:write",
+                "users:read",
+                "users:read.email",
+                "users.profile:read"
+            ]
+        },
+        "pkce_enabled": false
     },
-     
-    "slash_commands": [
-      {
-        "command": "/set-model",
-        "description": "Set your preferred AI model (openai or deepseek)",
-        "usage_hint": "[openai|deepseek]",
-        "should_escape": false
-      },
-      {
-        "command": "/current-model",
-        "description": "Check which AI model is currently active",
-        "should_escape": false
-      }
-    ]
- 
-
-  },
-  "oauth_config": {
-    "scopes": {
-      "bot": [
-        "app_mentions:read",
-        "assistant:write",
-        "channels:history",
-        "chat:write",
-        "files:read",
-        "groups:history",
-        "im:history",
-        "im:write",
-        "canvases:write",
-        "commands"
-      ]
+    "settings": {
+        "event_subscriptions": {
+            "bot_events": [
+                "assistant_thread_context_changed",
+                "assistant_thread_started",
+                "message.im",
+                "app_mention"
+            ]
+        },
+        "interactivity": {
+            "is_enabled": true
+        },
+        "org_deploy_enabled": false,
+        "socket_mode_enabled": true,
+        "token_rotation_enabled": false,
+        "is_mcp_enabled": true
     }
-  },
-  "settings": {
-    "event_subscriptions": {
-      "bot_events": [
-        "assistant_thread_context_changed",
-        "assistant_thread_started",
-        "message.im",
-        "app_mention"
-      ]
-    },
-    "interactivity": {
-      "is_enabled": true
-    },
-    "org_deploy_enabled": false,
-    "socket_mode_enabled": true,
-    "token_rotation_enabled": false
-  }
 }
