@@ -17,6 +17,8 @@ const { SLACK_TOOLS, SLACK_TOOL_NAMES, executeSlackTool } = require('./slackTool
 const { getDescribe, getRecord, updateRecord } = require('./salesforce');
 // "Reading / thinking" indicators (Assistant status + animated channel placeholder)
 const { createAssistantProgress, createChannelProgress, toolLabel } = require('./progress');
+// Structured Opportunity Review card (AI judgment + KPIs computed from Salesforce data)
+const { REVIEW_TOOL, buildOpportunityReviewBlocks } = require('./reviewBlocks');
 const {
   buildRecordBlocks,
   buildEditConfirmBlocks,
@@ -174,13 +176,17 @@ function extractRecords(result) {
  * @param {Object} ctx - Request context: { client, userId, channelId, contextChannelId, progress? }
  * @param {Object} [options] - Optional overrides
  * @param {number} [options.maxIterations=8] - Safety cap to prevent infinite tool loops
- * @returns {Promise<{text: string, records: Object|null, pendingEdits: Object[]}>}
- *   Final reply text, the records of the last data query (rendered as cards) and edits awaiting confirmation
+ * @returns {Promise<{text: string, records: Object|null, pendingEdits: Object[], review?: Object}>}
+ *   Final reply text, the records of the last data query (rendered as cards), edits awaiting confirmation
+ *   and, after an opportunity analysis, the structured review ({ data, insights })
  * @throws {Error} If OpenAI fails
  */
 async function runWithTools(messages, ctx, { maxIterations = 8 } = {}) {
   ctx.pendingEdits = [];
   let records = null;
+  // Set when analyze_opportunity succeeds: the next model call must present the review card
+  let insights = null;
+  let reviewPending = false;
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     if (iteration > 0) ctx.progress?.thinking();
@@ -189,16 +195,18 @@ async function runWithTools(messages, ctx, { maxIterations = 8 } = {}) {
       model: 'gpt-4o-mini',
       n: 1,
       messages,
-      tools: [...SF_TOOLS, ...SLACK_TOOLS],
-      // "auto" lets the model decide whether to call a tool or respond directly
-      tool_choice: 'auto',
+      tools: insights ? [...SF_TOOLS, ...SLACK_TOOLS, REVIEW_TOOL] : [...SF_TOOLS, ...SLACK_TOOLS],
+      // "auto" lets the model decide; right after an analysis we force the structured review
+      tool_choice: reviewPending ? { type: 'function', function: { name: REVIEW_TOOL.function.name } } : 'auto',
       temperature: 0.3,
     });
+    reviewPending = false;
 
     const choice = response.choices[0];
 
-    // If the model chose to respond directly (no tool calls), return the text
-    if (choice.finish_reason === 'stop' || !choice.message.tool_calls) {
+    // If the model chose to respond directly (no tool calls), return the text.
+    // (finish_reason is "stop" even with tool calls when tool_choice is forced, so check tool_calls itself)
+    if (!choice.message.tool_calls?.length) {
       return { text: mdToSlack(choice.message.content), records, pendingEdits: ctx.pendingEdits };
     }
 
@@ -208,6 +216,12 @@ async function runWithTools(messages, ctx, { maxIterations = 8 } = {}) {
     // Execute each tool call the AI requested (may be multiple in one turn)
     for (const toolCall of choice.message.tool_calls) {
       const toolName = toolCall.function.name;
+
+      // The review is the final answer — render it without another model round-trip
+      if (toolName === REVIEW_TOOL.function.name && insights) {
+        const data = JSON.parse(toolCall.function.arguments || '{}');
+        return { text: data.summary || '', records: null, pendingEdits: ctx.pendingEdits, review: { data, insights } };
+      }
 
       let toolResult;
       try {
@@ -219,6 +233,14 @@ async function runWithTools(messages, ctx, { maxIterations = 8 } = {}) {
 
         // Remember the latest record set; it is shown as cards with the final answer
         if (RECORD_TOOLS.has(toolName)) records = extractRecords(toolResult) || records;
+
+        if (toolName === 'analyze_opportunity') {
+          const data = JSON.parse(toolResult);
+          if (data.opportunity) {
+            insights = data;
+            reviewPending = true;
+          }
+        }
       } catch (err) {
         // Return error as a tool result so the AI can explain it or retry
         toolResult = JSON.stringify({ error: err.data?.error || err.message });
@@ -248,7 +270,9 @@ async function runWithTools(messages, ctx, { maxIterations = 8 } = {}) {
  * @param {string} requesterId - Slack user Id; only they can confirm proposed edits
  * @returns {Promise<{text: string, blocks: Object[]}>} chat.postMessage arguments
  */
-async function buildReplyMessage({ text, records, pendingEdits }, requesterId) {
+async function buildReplyMessage({ text, records, pendingEdits, review }, requesterId) {
+  if (review) return buildOpportunityReviewBlocks(review.data, review.insights);
+
   const blocks = textToBlocks(text);
 
   for (const edit of pendingEdits) {
@@ -311,14 +335,9 @@ Salesforce — editing records:
 - Ids of records shown earlier are in their Salesforce links in the conversation history.
 
 Opportunity summary & next actions:
-- When asked for a summary, conclusion, health, risk or next action of an opportunity, call analyze_opportunity and base your answer on its data (amount, close date, discovery, activities, history, signals).
-- Answer in this structure (the opportunity card is shown automatically below, so do not repeat its fields):
-  *Kesimpulan* — health label 🟢 On track / 🟡 Needs attention / 🔴 At risk, then 2-3 sentences explaining why.
-  *Amount & Close Date* — is the amount set and realistic for the stage/probability; days to close, overdue close date, how often it was pushed.
-  *Discovery* — review the Discovery Information fields (Salesforce Implementation Objective, Current Tools, Integration, Expected Impact, Implementation Timeline, Standard Business Process, Quip Link): what is known and which are empty. Discovery Check unchecked means discovery has not been validated yet — call it out.
-  *Activity* — last interaction and how long ago, activity in the last 30 days, upcoming or overdue tasks.
-  *Next Actions* — 3-5 numbered, concrete actions (who/what/by when), most important first, each tied to a gap or risk above.
-- Use the signals, do not invent facts. Flag red flags: close date passed or pushed repeatedly, no activity for 14+ days, nothing scheduled, missing amount, empty discovery, long time in the same stage.
+- When asked for a summary, conclusion, health, risk or next action of an opportunity, call analyze_opportunity. You will then present the result with present_opportunity_review (a formatted card) — never write the review as plain text.
+- Judge from the data only: amount vs stage/probability; close date passed, days left and how often it was pushed; Discovery Information fields (Salesforce Implementation Objective, Current Tools, Integration, Expected Impact, Implementation Timeline, Standard Business Process, Quip Link) — which are filled or empty; Discovery Check unchecked means discovery is not validated; activity recency, upcoming and overdue tasks.
+- Red flags: close date passed or pushed repeatedly, no activity for 14+ days, nothing scheduled, missing amount, empty discovery, long time in the same stage.
 - If the user wants to act on a recommendation (e.g. move the close date), use update_record.
 
 Slack channels:
@@ -631,6 +650,8 @@ async function handleEditDecision({ ack, body, client, action, logger }, save) {
 }
 
 app.action('sf_confirm_edit', args => handleEditDecision(args, true));
+// Link buttons still send an interaction payload — acknowledge it so Slack shows no warning
+app.action('sf_open_record', async ({ ack }) => ack());
 app.action('sf_cancel_edit', args => handleEditDecision(args, false));
 
 app.command('/timesheet-lks', async ({ ack, body, client }) => {

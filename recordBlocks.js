@@ -10,7 +10,7 @@
 const { sfUrl, getDescribe, htmlToText } = require('./salesforce');
 
 const MAX_CARDS = 15;
-const MAX_CARD_FIELDS = 10;
+const MAX_CARD_FIELDS = 8;
 const MAX_MODAL_FIELDS = 20;
 const DISPLAY_TZ = process.env.DISPLAY_TZ || 'Asia/Jakarta';
 const DEFAULT_CURRENCY = process.env.SF_CURRENCY || 'IDR';
@@ -50,6 +50,8 @@ const EDITABLE_TYPES = new Set([
   'date',
   'datetime',
 ]);
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 const truncate = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 
@@ -123,13 +125,11 @@ function formatValue(value, type, currency = DEFAULT_CURRENCY) {
       return new Intl.NumberFormat('id-ID').format(value);
     case 'percent':
       return `${value}%`;
-    case 'date':
-      return new Date(`${value}T00:00:00Z`).toLocaleDateString('en-GB', {
-        day: 'numeric',
-        month: 'short',
-        year: 'numeric',
-        timeZone: 'UTC',
-      });
+    case 'date': {
+      // Fixed 3-letter months (ICU renders September as "Sept")
+      const [year, month, day] = String(value).slice(0, 10).split('-');
+      return `${Number(day)} ${MONTHS[Number(month) - 1]} ${year}`;
+    }
     case 'datetime':
       return new Date(normalizeSfDateTime(value)).toLocaleString('en-GB', {
         day: 'numeric',
@@ -180,20 +180,22 @@ function buildRecordCard(record, describe) {
   }
   pairs = pairs.slice(0, MAX_CARD_FIELDS);
 
+  // One "Label: value" line per field — compact and readable in both wide and narrow (assistant pane) views
+  const lines = pairs.map(([path, value]) => {
+    const meta = metaMap.get(path);
+    return `*${escapeMrkdwn(fieldLabel(path, metaMap))}:*  ${formatValue(value, meta?.type, currency).replace(/\n/g, ' ')}`;
+  });
+
   const section = {
     type: 'section',
-    text: { type: 'mrkdwn', text: `${titleText}\n_${escapeMrkdwn(describe?.label || objectName || 'Result')}_` },
+    text: {
+      type: 'mrkdwn',
+      text: truncate(
+        [`${titleText}  ·  _${escapeMrkdwn(describe?.label || objectName || 'Result')}_`, ...lines].join('\n'),
+        2990
+      ),
+    },
   };
-
-  if (pairs.length > 0) {
-    section.fields = pairs.map(([path, value]) => {
-      const meta = metaMap.get(path);
-      return {
-        type: 'mrkdwn',
-        text: truncate(`*${escapeMrkdwn(fieldLabel(path, metaMap))}*\n${formatValue(value, meta?.type, currency)}`, 1990),
-      };
-    });
-  }
 
   if (describe?.updateable && record.Id) {
     const editFields = pairs.map(([path]) => path).filter(path => !path.includes('.'));
@@ -498,6 +500,7 @@ function textToBlocks(text) {
 }
 
 module.exports = {
+  formatValue,
   buildRecordBlocks,
   buildEditConfirmBlocks,
   buildEditModal,
