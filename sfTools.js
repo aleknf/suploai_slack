@@ -11,10 +11,34 @@
  *   3. executeTool() dispatches to the correct salesforce.js function
  *   4. Results are fed back to OpenAI for the final natural-language response
  *
- * Phase 1: Read-only (query + search). Write operations will be added in Phase 2.
+ * Read tools execute immediately. The update_record tool never writes directly — it queues the change
+ * in ctx.pendingEdits so app.js can show a confirmation card with Save/Cancel buttons.
  */
 
-const { describeObject, runSOQL, runSOSL, getRecord, getActivityHistory, getCaseDetails, queryCases } = require('./salesforce');
+const {
+  describeObject,
+  getDescribe,
+  runSOQL,
+  runSOSL,
+  getRecord,
+  getActivityHistory,
+  getCaseDetails,
+  queryCases,
+  findOpportunitiesByName,
+  getOpportunityInsights,
+  createRecord,
+  findUserIdByEmail,
+  getClosedTaskStatus,
+  todayJakarta,
+} = require('./salesforce');
+
+// Id prefixes of person objects — activities link to them via WhoId instead of WhatId
+const WHO_PREFIXES = { '003': 'Contact', '00Q': 'Lead' };
+
+const ACTIVITY_SUBTYPE = { call: 'Call', email: 'Email' };
+
+// Objects searched when the user gives a keyword without naming an object
+const DEFAULT_SEARCH_OBJECTS = ['Account', 'Contact', 'Lead', 'Opportunity', 'Case'];
 
 /**
  * OpenAI tool schema definitions.
@@ -29,8 +53,9 @@ const SF_TOOLS = [
     function: {
       name: 'describe_salesforce_object',
       description:
-        'Fetches the field schema (field names, types, labels) for a given Salesforce object. ' +
-        'Call this BEFORE constructing any SOQL query so you know which fields are available. ' +
+        'Fetches the field schema (field names, types, labels, picklist values, updateable) for a Salesforce object. ' +
+        'Call this for custom objects/fields you are unsure about, when a query fails on an invalid field, ' +
+        'or before updating a record. Not needed for well-known standard fields. ' +
         'Supported objects include: Contact, Lead, Opportunity, Task, Event, Project__c, Account, Case, and others.',
       parameters: {
         type: 'object',
@@ -51,8 +76,9 @@ const SF_TOOLS = [
       name: 'query_records',
       description:
         'Executes a SOQL query against Salesforce and returns matching records. ' +
-        'Use this when you know the exact field names and want filtered, structured results. ' +
-        'Always call describe_salesforce_object first if you are unsure of the available fields.',
+        'Use this for structured filters (status, stage, dates, owner, amount, etc.). ' +
+        'Always SELECT Id plus the Name field (or CaseNumber/Subject) and the fields relevant to the question. ' +
+        'Results are shown to the user as record cards automatically.',
       parameters: {
         type: 'object',
         properties: {
@@ -74,7 +100,7 @@ const SF_TOOLS = [
       description:
         'Performs a keyword search across one or more Salesforce objects using SOSL. ' +
         'Best for finding records when you only have a name or partial keyword and do not know the exact field. ' +
-        'Ask the user which object(s) to search if they have not specified.',
+        'Never ask the user which object to search — infer it, or omit object_names to search the common objects.',
       parameters: {
         type: 'object',
         properties: {
@@ -85,16 +111,14 @@ const SF_TOOLS = [
           object_names: {
             type: 'array',
             items: { type: 'string' },
-            description:
-              'List of Salesforce object API names to search within. ' +
-              'Example: ["Contact", "Lead"]. Ask the user if not specified.',
+            description: `List of Salesforce object API names to search within, e.g. ["Contact", "Lead"]. Defaults to ${JSON.stringify(DEFAULT_SEARCH_OBJECTS)} when omitted.`,
           },
           limit: {
             type: 'integer',
             description: 'Maximum number of records to return per object. Defaults to 10.',
           },
         },
-        required: ['search_term', 'object_names'],
+        required: ['search_term'],
       },
     },
   },
@@ -213,6 +237,113 @@ const SF_TOOLS = [
       },
     },
   },
+
+  {
+    type: 'function',
+    function: {
+      name: 'analyze_opportunity',
+      description:
+        'Collects everything needed to assess one Opportunity and recommend next actions: amount, close date, ' +
+        'stage, discovery data, activities (tasks/events), stage/close-date history and pre-computed health signals. ' +
+        'Use it when the user asks for a summary, conclusion, health check, risk or next action of an opportunity.',
+      parameters: {
+        type: 'object',
+        properties: {
+          opportunity_id: {
+            type: 'string',
+            description: 'The Opportunity Id, if known.',
+          },
+          opportunity_name: {
+            type: 'string',
+            description: 'Full or partial Opportunity name, used when the Id is not known.',
+          },
+        },
+        required: [],
+      },
+    },
+  },
+
+  {
+    type: 'function',
+    function: {
+      name: 'log_activity',
+      description:
+        'Logs a completed activity (call, meeting, email, note) as a Task on a Salesforce record — usually an ' +
+        'Opportunity. Use when the user reports something that happened ("catat: barusan call dengan ...", ' +
+        '"log meeting with ..."). It is saved immediately; the user gets an Undo button. Do not ask for confirmation.',
+      parameters: {
+        type: 'object',
+        properties: {
+          opportunity_name: {
+            type: 'string',
+            description: 'Full or partial Opportunity name the activity belongs to.',
+          },
+          record_id: {
+            type: 'string',
+            description: 'Id of the related record, when known (Opportunity, Account, Contact, Lead, Case...).',
+          },
+          object_name: {
+            type: 'string',
+            description: 'API name of the object of record_id. Defaults to "Opportunity".',
+          },
+          activity_type: {
+            type: 'string',
+            enum: ['call', 'meeting', 'email', 'other'],
+          },
+          subject: {
+            type: 'string',
+            description: 'Short subject, e.g. "Call - revisi harga" (max ~80 chars).',
+          },
+          description: {
+            type: 'string',
+            description: "The user's notes, keeping all details (who, what was discussed, requests, follow-ups).",
+          },
+          activity_date: {
+            type: 'string',
+            description: 'Date it happened, YYYY-MM-DD. Defaults to today.',
+          },
+          language: {
+            type: 'string',
+            enum: ['id', 'en'],
+            description: 'Language of the user message.',
+          },
+        },
+        required: ['activity_type', 'subject'],
+      },
+    },
+  },
+
+  {
+    type: 'function',
+    function: {
+      name: 'update_record',
+      description:
+        'Proposes an edit to fields of an existing Salesforce record. The change is NOT saved immediately: ' +
+        'the user gets a confirmation card with Save/Cancel buttons. Find the record Id first (query/search) ' +
+        'and use exact field API names and valid picklist values (describe_salesforce_object if unsure). ' +
+        'Do not ask the user for confirmation in text — the card is the confirmation.',
+      parameters: {
+        type: 'object',
+        properties: {
+          object_name: {
+            type: 'string',
+            description: 'The Salesforce API name of the object (e.g. "Opportunity").',
+          },
+          record_id: {
+            type: 'string',
+            description: 'The 15 or 18-character Salesforce record Id.',
+          },
+          fields: {
+            type: 'object',
+            description:
+              'Map of field API name to new value, e.g. {"StageName": "Closed Won", "Amount": 150000000}. ' +
+              'Dates use YYYY-MM-DD. Use null to clear a field.',
+          },
+        },
+        required: ['object_name', 'record_id', 'fields'],
+      },
+    },
+  },
 ];
 
 /**
@@ -221,10 +352,11 @@ const SF_TOOLS = [
  *
  * @param {string} toolName - The name of the tool as defined in SF_TOOLS (e.g. "query_records")
  * @param {Object} args - The parsed arguments object from OpenAI's tool_call
+ * @param {Object} ctx - Per-request context; update_record pushes proposals into ctx.pendingEdits
  * @returns {Promise<string>} JSON string of the tool result, to be sent back to OpenAI
  * @throws {Error} If the tool name is unknown or the underlying SF call fails
  */
-async function executeTool(toolName, args) {
+async function executeTool(toolName, args, ctx) {
   switch (toolName) {
     case 'describe_salesforce_object': {
       const result = await describeObject(args.object_name);
@@ -239,7 +371,7 @@ async function executeTool(toolName, args) {
     case 'search_records': {
       const result = await runSOSL(
         args.search_term,
-        args.object_names,
+        args.object_names?.length ? args.object_names : DEFAULT_SEARCH_OBJECTS,
         args.limit || 10
       );
       return JSON.stringify(result);
@@ -279,9 +411,164 @@ async function executeTool(toolName, args) {
       return JSON.stringify(result);
     }
 
+    case 'analyze_opportunity': {
+      let oppId = args.opportunity_id;
+      if (!oppId) {
+        if (!args.opportunity_name) return JSON.stringify({ error: 'Provide opportunity_id or opportunity_name.' });
+        const candidates = await findOpportunitiesByName(args.opportunity_name);
+        if (candidates.length === 0) return JSON.stringify({ error: `No opportunity matches "${args.opportunity_name}".` });
+        const exact = candidates.filter(c => c.Name.toLowerCase() === args.opportunity_name.toLowerCase());
+        if (exact.length === 1) candidates.splice(0, candidates.length, exact[0]);
+        if (candidates.length > 1) {
+          return JSON.stringify({ status: 'multiple_matches', message: 'Ask the user which one.', candidates });
+        }
+        oppId = candidates[0].Id;
+      }
+      return JSON.stringify(await getOpportunityInsights(oppId));
+    }
+
+    case 'log_activity':
+      return JSON.stringify(await logActivity(args, ctx));
+
+    case 'update_record':
+      return JSON.stringify(await proposeUpdate(args, ctx));
+
     default:
       throw new Error(`Unknown tool: ${toolName}`);
   }
+}
+
+/**
+ * Validates a proposed record edit against the object describe and queues it for user confirmation.
+ * Returns errors to the AI (instead of throwing) so it can correct field names or values and retry.
+ *
+ * @param {Object} args - { object_name, record_id, fields }
+ * @param {Object} ctx - Per-request context holding the pendingEdits array
+ * @returns {Promise<Object>} Status payload for the AI
+ */
+async function proposeUpdate({ object_name, record_id, fields }, ctx) {
+  const entries = Object.entries(fields || {});
+  if (entries.length === 0) return { error: 'No fields to update were provided.' };
+
+  const describe = await getDescribe(object_name);
+  const fieldMap = new Map(describe.fields.map(f => [f.name.toLowerCase(), f]));
+
+  const changes = {};
+  const problems = [];
+  for (const [name, value] of entries) {
+    const meta = fieldMap.get(name.toLowerCase());
+    if (!meta) problems.push(`${name}: field does not exist on ${object_name}`);
+    else if (!meta.updateable) problems.push(`${meta.name}: field is read-only`);
+    else if (meta.type === 'picklist' && value !== null && !meta.picklistValues.some(v => v.active && v.value === value))
+      problems.push(
+        `${meta.name}: "${value}" is not a valid value. Valid: ${meta.picklistValues
+          .filter(v => v.active)
+          .map(v => v.value)
+          .join(', ')}`
+      );
+    else changes[meta.name] = value;
+  }
+  if (problems.length > 0) return { error: 'Invalid update', problems };
+
+  // Fetch current values so the confirmation card can show before → after
+  const current = await getRecord(object_name, record_id, [
+    ...new Set([...Object.keys(changes), describe.fields.find(f => f.nameField)?.name || 'Id']),
+  ]);
+
+  ctx.pendingEdits.push({ objectName: describe.name, recordId: current.Id || record_id, changes, current });
+  return {
+    status: 'awaiting_user_confirmation',
+    message: 'A confirmation card with Save/Cancel buttons is shown to the user. Tell them to review and click Save.',
+  };
+}
+
+/**
+ * Resolves the Salesforce User behind the Slack user (by profile email), so activities are owned by them.
+ */
+async function slackUserToSalesforceUser(ctx) {
+  try {
+    const { user } = await ctx.client.users.info({ user: ctx.userId });
+    return { email: user.profile?.email, name: user.real_name || user.name, sfUserId: await findUserIdByEmail(user.profile?.email) };
+  } catch (_) {
+    return { sfUserId: null };
+  }
+}
+
+/**
+ * Creates a completed Task for something that already happened and queues a result card (with Undo).
+ *
+ * @param {Object} args - log_activity arguments
+ * @param {Object} ctx - Per-request context; the logged activity is pushed to ctx.loggedActivities
+ * @returns {Promise<Object>} Status payload for the AI
+ */
+async function logActivity(args, ctx) {
+  let recordId = args.record_id;
+  let objectName = args.object_name || 'Opportunity';
+
+  if (!recordId) {
+    if (!args.opportunity_name) {
+      return { error: 'Which opportunity (or record) is this activity for? Ask the user.' };
+    }
+    const candidates = await findOpportunitiesByName(args.opportunity_name);
+    const exact = candidates.filter(c => c.Name.toLowerCase() === args.opportunity_name.toLowerCase());
+    const matches = exact.length === 1 ? exact : candidates;
+    if (matches.length === 0) return { error: `No opportunity matches "${args.opportunity_name}".` };
+    if (matches.length > 1) return { status: 'multiple_matches', message: 'Ask the user which one.', candidates: matches };
+    recordId = matches[0].Id;
+    objectName = 'Opportunity';
+  }
+
+  const whoObject = WHO_PREFIXES[recordId.slice(0, 3)];
+  if (whoObject) objectName = whoObject;
+
+  const describe = await getDescribe(objectName);
+  const nameField = describe.fields.find(f => f.nameField)?.name || 'Id';
+  const related = await getRecord(objectName, recordId, ['Id', nameField]);
+
+  const taskDescribe = await getDescribe('Task');
+  const taskFields = new Map(taskDescribe.fields.map(f => [f.name, f]));
+  const typeValue = taskFields
+    .get('Type')
+    ?.picklistValues?.find(v => v.active && v.value.toLowerCase() === args.activity_type)?.value;
+
+  const user = await slackUserToSalesforceUser(ctx);
+  const activityDate = /^\d{4}-\d{2}-\d{2}$/.test(args.activity_date || '') ? args.activity_date : todayJakarta();
+
+  const task = {
+    Subject: String(args.subject).slice(0, 255),
+    Description: [args.description, `— Dicatat via Lori AI (Slack) oleh ${user.name || ctx.userId}`]
+      .filter(Boolean)
+      .join('\n\n'),
+    ActivityDate: activityDate,
+    Status: await getClosedTaskStatus(),
+    [whoObject ? 'WhoId' : 'WhatId']: related.Id,
+    ...(user.sfUserId ? { OwnerId: user.sfUserId } : {}),
+    ...(typeValue ? { Type: typeValue } : {}),
+    ...(ACTIVITY_SUBTYPE[args.activity_type] && taskFields.get('TaskSubtype')?.createable
+      ? { TaskSubtype: ACTIVITY_SUBTYPE[args.activity_type] }
+      : {}),
+  };
+
+  const taskId = await createRecord('Task', task);
+
+  ctx.loggedActivities.push({
+    taskId,
+    requesterId: ctx.userId,
+    language: args.language || 'id',
+    activityType: args.activity_type,
+    subject: task.Subject,
+    description: args.description,
+    activityDate,
+    related: { objectName: describe.name, objectLabel: describe.label, id: related.Id, name: related[nameField] },
+    ownerName: user.sfUserId ? user.name : null,
+  });
+
+  return {
+    status: 'logged',
+    taskId,
+    relatedTo: related[nameField],
+    message: 'Saved. A card with the logged activity and an Undo button is shown to the user; reply with one short sentence.',
+  };
 }
 
 module.exports = { SF_TOOLS, executeTool };
