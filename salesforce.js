@@ -257,6 +257,81 @@ async function updateRecord(objectName, recordId, fields) {
 }
 
 /**
+ * Creates a record (POST). Returns the new record Id.
+ *
+ * @param {string} objectName - API name of the Salesforce object (e.g. "Task")
+ * @param {Object} fields - Field API name → value
+ * @returns {Promise<string>} New record Id
+ * @throws {Error} If validation fails or access is denied
+ */
+async function createRecord(objectName, fields) {
+  const token = await getSalesforceToken();
+  const url = `${sfUrl}/services/data/${SF_API_VERSION}/sobjects/${objectName}`;
+
+  const response = await fetch(url, { method: 'POST', headers: buildHeaders(token), body: JSON.stringify(fields) });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    let message = errorText;
+    try {
+      message = JSON.parse(errorText).map(e => `${e.errorCode}: ${e.message}`).join('; ');
+    } catch (_) {}
+    throw new Error(`Create ${objectName} failed: ${message}`);
+  }
+
+  return (await response.json()).id;
+}
+
+/**
+ * Deletes a record (used to undo an activity logged from Slack).
+ *
+ * @param {string} objectName - API name of the Salesforce object
+ * @param {string} recordId - Record Id
+ * @throws {Error} If the delete fails
+ */
+async function deleteRecord(objectName, recordId) {
+  const token = await getSalesforceToken();
+  const url = `${sfUrl}/services/data/${SF_API_VERSION}/sobjects/${objectName}/${recordId}`;
+
+  const response = await fetch(url, { method: 'DELETE', headers: buildHeaders(token) });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Delete ${objectName}/${recordId} failed: ${errorText}`);
+  }
+}
+
+/**
+ * Finds the active Salesforce User Id for an email (to attribute Slack actions to the right person).
+ *
+ * @param {string} email - Email from the Slack profile
+ * @returns {Promise<string|null>} User Id, or null when no active user matches
+ */
+async function findUserIdByEmail(email) {
+  if (!email) return null;
+  const { records } = await runSOQL(
+    `SELECT Id FROM User WHERE IsActive = true AND (Email = '${escapeSoql(email)}' OR Username = '${escapeSoql(email)}') LIMIT 1`
+  );
+  return records[0]?.Id || null;
+}
+
+let closedTaskStatus = null;
+
+/**
+ * The org's "completed" Task status (e.g. "Completed"), looked up once from TaskStatus.
+ *
+ * @returns {Promise<string>}
+ */
+async function getClosedTaskStatus() {
+  if (closedTaskStatus) return closedTaskStatus;
+  const { records } = await runSOQL(
+    'SELECT ApiName FROM TaskStatus WHERE IsClosed = true ORDER BY SortOrder LIMIT 1'
+  );
+  closedTaskStatus = records[0]?.ApiName || 'Completed';
+  return closedTaskStatus;
+}
+
+/**
  * Retrieves the activity history (Tasks and Events) associated with a Salesforce record.
  * Activities are linked via WhatId (for non-person objects) or WhoId (for Contacts/Leads).
  * This function queries both Task and Event objects to give a full timeline.
@@ -398,7 +473,7 @@ async function queryCases({ status, priority, accountName, contactName, subjectK
 
 // Opportunity fields used for deal analysis (kept only when present/visible in the org)
 const INSIGHT_OPP_FIELDS = [
-  'Id', 'Name', 'Account.Name', 'Owner.Name', 'StageName', 'Amount', 'Probability', 'ExpectedRevenue',
+  'Id', 'Name', 'Account.Name', 'OwnerId', 'Owner.Name', 'StageName', 'Amount', 'Probability', 'ExpectedRevenue',
   'CloseDate', 'ForecastCategoryName', 'NextStep', 'Description', 'Type', 'LeadSource', 'CreatedDate',
   'LastActivityDate', 'IsClosed', 'IsWon',
 ];
@@ -627,6 +702,11 @@ module.exports = {
   runSOSL,
   getRecord,
   getActivityHistory,
+  createRecord,
+  deleteRecord,
+  findUserIdByEmail,
+  getClosedTaskStatus,
+  todayJakarta,
   findOpportunitiesByName,
   getOpportunityInsights,
   getCaseDetails,

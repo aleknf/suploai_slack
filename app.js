@@ -14,7 +14,9 @@ const fetch = require('node-fetch'); //use npm install node-fetch@2
 const { SF_TOOLS, executeTool } = require('./sfTools');
 // Slack tools: channel history + joining channels
 const { SLACK_TOOLS, SLACK_TOOL_NAMES, executeSlackTool } = require('./slackTools');
-const { getDescribe, getRecord, updateRecord } = require('./salesforce');
+const { getDescribe, getRecord, updateRecord, createRecord, deleteRecord } = require('./salesforce');
+// Cards for activities/tasks created from Slack
+const { buildLoggedActivityBlocks, ACTIVITY_LABELS } = require('./activityBlocks');
 // "Reading / thinking" indicators (Assistant status + animated channel placeholder)
 const { createAssistantProgress, createChannelProgress, toolLabel } = require('./progress');
 // Structured Opportunity Review card (AI judgment + KPIs computed from Salesforce data)
@@ -142,6 +144,7 @@ const RECORD_TOOLS = new Set([
   'get_case_details',
   'query_cases',
   'analyze_opportunity',
+  'log_activity',
 ]);
 
 /**
@@ -183,6 +186,7 @@ function extractRecords(result) {
  */
 async function runWithTools(messages, ctx, { maxIterations = 8 } = {}) {
   ctx.pendingEdits = [];
+  ctx.loggedActivities = [];
   let records = null;
   // Set when analyze_opportunity succeeds: the next model call must present the review card
   let insights = null;
@@ -207,7 +211,12 @@ async function runWithTools(messages, ctx, { maxIterations = 8 } = {}) {
     // If the model chose to respond directly (no tool calls), return the text.
     // (finish_reason is "stop" even with tool calls when tool_choice is forced, so check tool_calls itself)
     if (!choice.message.tool_calls?.length) {
-      return { text: mdToSlack(choice.message.content), records, pendingEdits: ctx.pendingEdits };
+      return {
+        text: mdToSlack(choice.message.content),
+        records,
+        pendingEdits: ctx.pendingEdits,
+        loggedActivities: ctx.loggedActivities,
+      };
     }
 
     // Append the assistant's tool-calling message to the conversation history
@@ -220,7 +229,13 @@ async function runWithTools(messages, ctx, { maxIterations = 8 } = {}) {
       // The review is the final answer — render it without another model round-trip
       if (toolName === REVIEW_TOOL.function.name && insights) {
         const data = JSON.parse(toolCall.function.arguments || '{}');
-        return { text: data.summary || '', records: null, pendingEdits: ctx.pendingEdits, review: { data, insights } };
+        return {
+          text: data.summary || '',
+          records: null,
+          pendingEdits: ctx.pendingEdits,
+          loggedActivities: ctx.loggedActivities,
+          review: { data, insights },
+        };
       }
 
       let toolResult;
@@ -260,6 +275,7 @@ async function runWithTools(messages, ctx, { maxIterations = 8 } = {}) {
     text: 'Sorry, I ran into an issue retrieving that information. Please try again.',
     records: null,
     pendingEdits: [],
+    loggedActivities: ctx.loggedActivities,
   };
 }
 
@@ -270,17 +286,19 @@ async function runWithTools(messages, ctx, { maxIterations = 8 } = {}) {
  * @param {string} requesterId - Slack user Id; only they can confirm proposed edits
  * @returns {Promise<{text: string, blocks: Object[]}>} chat.postMessage arguments
  */
-async function buildReplyMessage({ text, records, pendingEdits, review }, requesterId) {
+async function buildReplyMessage({ text, records, pendingEdits, loggedActivities = [], review }, requesterId) {
   if (review) return buildOpportunityReviewBlocks(review.data, review.insights);
 
   const blocks = textToBlocks(text);
+
+  for (const activity of loggedActivities) blocks.push(...buildLoggedActivityBlocks(activity));
 
   for (const edit of pendingEdits) {
     blocks.push(...(await buildEditConfirmBlocks(edit, requesterId)));
   }
 
-  // Skip record cards when an edit is pending — the lookup query would only add noise
-  if (pendingEdits.length === 0 && records?.records.length && blocks.length < 45) {
+  // Skip record cards when an edit/log happened — the lookup query would only add noise
+  if (pendingEdits.length === 0 && loggedActivities.length === 0 && records?.records.length && blocks.length < 45) {
     blocks.push(...(await buildRecordBlocks(records.records, { totalSize: records.totalSize, maxBlocks: 50 - blocks.length })));
   }
 
@@ -333,6 +351,10 @@ Salesforce — editing records:
 - Use update_record to change fields. It shows the user a Save/Cancel confirmation card; nothing is saved until they click Save. Do not ask for confirmation in text.
 - Find the record Id first when needed. If several records match, list the candidates and ask which one.
 - Ids of records shown earlier are in their Salesforce links in the conversation history.
+
+Logging activities:
+- When the user reports something that happened (a call, meeting, email, client request — e.g. "catat: barusan call dengan Pak Budi, dia minta revisi harga"), call log_activity right away with a short subject and the full notes as description. Infer the opportunity from the message or the conversation; ask only if it is unknown.
+- The saved activity is shown as a card with an Undo button — reply with one short sentence only. If the notes contain a follow-up, you may suggest it in that sentence.
 
 Opportunity summary & next actions:
 - When asked for a summary, conclusion, health, risk or next action of an opportunity, call analyze_opportunity. You will then present the result with present_opportunity_review (a formatted card) — never write the review as plain text.
@@ -650,6 +672,87 @@ async function handleEditDecision({ ack, body, client, action, logger }, save) {
 }
 
 app.action('sf_confirm_edit', args => handleEditDecision(args, true));
+/**
+ * "➕ Create Task" on an Opportunity Review next action: creates an open Task on the opportunity,
+ * assigned to the opportunity owner, and marks the action on the card.
+ */
+app.action('sf_create_task', async ({ ack, body, client, action, logger }) => {
+  await ack();
+  const { o, ow, s: subject, d: dueDate, l } = JSON.parse(action.value);
+  const L = ACTIVITY_LABELS[l] || ACTIVITY_LABELS.id;
+  const userId = body.user.id;
+
+  try {
+    const { user } = await client.users.info({ user: userId });
+    const task = {
+      Subject: subject,
+      WhatId: o,
+      Description: `Next action dari Opportunity Review Lori AI — dibuat via Slack oleh ${user.real_name || user.name}`,
+      ...(dueDate ? { ActivityDate: dueDate } : {}),
+    };
+
+    let taskId;
+    try {
+      taskId = await createRecord('Task', { ...task, ...(ow ? { OwnerId: ow } : {}) });
+    } catch (err) {
+      // Owner may be inactive or not assignable — fall back to the integration user
+      if (!ow) throw err;
+      taskId = await createRecord('Task', task);
+    }
+
+    const blocks = body.message.blocks.map(block =>
+      block.block_id === action.block_id
+        ? {
+            type: 'section',
+            block_id: block.block_id,
+            text: { type: 'mrkdwn', text: `${block.text.text}\n${L.taskCreated(userId, recordUrl('Task', taskId))}` },
+          }
+        : block
+    );
+    await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: body.message.text, blocks });
+  } catch (error) {
+    logger.error('Error creating task from next action:', error);
+    await client.chat.postEphemeral({
+      channel: body.channel.id,
+      user: userId,
+      thread_ts: body.message.thread_ts || body.message.ts,
+      text: `❌ ${error.message}`,
+    });
+  }
+});
+
+/**
+ * "↩️ Undo" on a logged activity: deletes the Task. Only the user who logged it may undo.
+ */
+app.action('sf_undo_task', async ({ ack, body, client, action, logger }) => {
+  await ack();
+  const { id, u, l } = JSON.parse(action.value);
+  const userId = body.user.id;
+  const threadTs = body.message.thread_ts || body.message.ts;
+
+  if (userId !== u) {
+    await client.chat.postEphemeral({
+      channel: body.channel.id,
+      user: userId,
+      thread_ts: threadTs,
+      text: l === 'en' ? `Only <@${u}> can undo this.` : `Hanya <@${u}> yang bisa membatalkan ini.`,
+    });
+    return;
+  }
+
+  try {
+    await deleteRecord('Task', id);
+    await resolveEditCard(
+      client,
+      body,
+      l === 'en' ? `↩️ Undone by <@${userId}> — activity deleted` : `↩️ Dibatalkan oleh <@${userId}> — aktivitas dihapus`
+    );
+  } catch (error) {
+    logger.error('Error undoing task:', error);
+    await client.chat.postEphemeral({ channel: body.channel.id, user: userId, thread_ts: threadTs, text: `❌ ${error.message}` });
+  }
+});
+
 // Link buttons still send an interaction payload — acknowledge it so Slack shows no warning
 app.action('sf_open_record', async ({ ack }) => ack());
 app.action('sf_cancel_edit', args => handleEditDecision(args, false));

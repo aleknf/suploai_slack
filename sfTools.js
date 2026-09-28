@@ -26,7 +26,16 @@ const {
   queryCases,
   findOpportunitiesByName,
   getOpportunityInsights,
+  createRecord,
+  findUserIdByEmail,
+  getClosedTaskStatus,
+  todayJakarta,
 } = require('./salesforce');
+
+// Id prefixes of person objects — activities link to them via WhoId instead of WhatId
+const WHO_PREFIXES = { '003': 'Contact', '00Q': 'Lead' };
+
+const ACTIVITY_SUBTYPE = { call: 'Call', email: 'Email' };
 
 // Objects searched when the user gives a keyword without naming an object
 const DEFAULT_SEARCH_OBJECTS = ['Account', 'Contact', 'Lead', 'Opportunity', 'Case'];
@@ -257,6 +266,56 @@ const SF_TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'log_activity',
+      description:
+        'Logs a completed activity (call, meeting, email, note) as a Task on a Salesforce record — usually an ' +
+        'Opportunity. Use when the user reports something that happened ("catat: barusan call dengan ...", ' +
+        '"log meeting with ..."). It is saved immediately; the user gets an Undo button. Do not ask for confirmation.',
+      parameters: {
+        type: 'object',
+        properties: {
+          opportunity_name: {
+            type: 'string',
+            description: 'Full or partial Opportunity name the activity belongs to.',
+          },
+          record_id: {
+            type: 'string',
+            description: 'Id of the related record, when known (Opportunity, Account, Contact, Lead, Case...).',
+          },
+          object_name: {
+            type: 'string',
+            description: 'API name of the object of record_id. Defaults to "Opportunity".',
+          },
+          activity_type: {
+            type: 'string',
+            enum: ['call', 'meeting', 'email', 'other'],
+          },
+          subject: {
+            type: 'string',
+            description: 'Short subject, e.g. "Call - revisi harga" (max ~80 chars).',
+          },
+          description: {
+            type: 'string',
+            description: "The user's notes, keeping all details (who, what was discussed, requests, follow-ups).",
+          },
+          activity_date: {
+            type: 'string',
+            description: 'Date it happened, YYYY-MM-DD. Defaults to today.',
+          },
+          language: {
+            type: 'string',
+            enum: ['id', 'en'],
+            description: 'Language of the user message.',
+          },
+        },
+        required: ['activity_type', 'subject'],
+      },
+    },
+  },
+
+  {
+    type: 'function',
+    function: {
       name: 'update_record',
       description:
         'Proposes an edit to fields of an existing Salesforce record. The change is NOT saved immediately: ' +
@@ -368,6 +427,9 @@ async function executeTool(toolName, args, ctx) {
       return JSON.stringify(await getOpportunityInsights(oppId));
     }
 
+    case 'log_activity':
+      return JSON.stringify(await logActivity(args, ctx));
+
     case 'update_record':
       return JSON.stringify(await proposeUpdate(args, ctx));
 
@@ -417,6 +479,95 @@ async function proposeUpdate({ object_name, record_id, fields }, ctx) {
   return {
     status: 'awaiting_user_confirmation',
     message: 'A confirmation card with Save/Cancel buttons is shown to the user. Tell them to review and click Save.',
+  };
+}
+
+/**
+ * Resolves the Salesforce User behind the Slack user (by profile email), so activities are owned by them.
+ */
+async function slackUserToSalesforceUser(ctx) {
+  try {
+    const { user } = await ctx.client.users.info({ user: ctx.userId });
+    return { email: user.profile?.email, name: user.real_name || user.name, sfUserId: await findUserIdByEmail(user.profile?.email) };
+  } catch (_) {
+    return { sfUserId: null };
+  }
+}
+
+/**
+ * Creates a completed Task for something that already happened and queues a result card (with Undo).
+ *
+ * @param {Object} args - log_activity arguments
+ * @param {Object} ctx - Per-request context; the logged activity is pushed to ctx.loggedActivities
+ * @returns {Promise<Object>} Status payload for the AI
+ */
+async function logActivity(args, ctx) {
+  let recordId = args.record_id;
+  let objectName = args.object_name || 'Opportunity';
+
+  if (!recordId) {
+    if (!args.opportunity_name) {
+      return { error: 'Which opportunity (or record) is this activity for? Ask the user.' };
+    }
+    const candidates = await findOpportunitiesByName(args.opportunity_name);
+    const exact = candidates.filter(c => c.Name.toLowerCase() === args.opportunity_name.toLowerCase());
+    const matches = exact.length === 1 ? exact : candidates;
+    if (matches.length === 0) return { error: `No opportunity matches "${args.opportunity_name}".` };
+    if (matches.length > 1) return { status: 'multiple_matches', message: 'Ask the user which one.', candidates: matches };
+    recordId = matches[0].Id;
+    objectName = 'Opportunity';
+  }
+
+  const whoObject = WHO_PREFIXES[recordId.slice(0, 3)];
+  if (whoObject) objectName = whoObject;
+
+  const describe = await getDescribe(objectName);
+  const nameField = describe.fields.find(f => f.nameField)?.name || 'Id';
+  const related = await getRecord(objectName, recordId, ['Id', nameField]);
+
+  const taskDescribe = await getDescribe('Task');
+  const taskFields = new Map(taskDescribe.fields.map(f => [f.name, f]));
+  const typeValue = taskFields
+    .get('Type')
+    ?.picklistValues?.find(v => v.active && v.value.toLowerCase() === args.activity_type)?.value;
+
+  const user = await slackUserToSalesforceUser(ctx);
+  const activityDate = /^\d{4}-\d{2}-\d{2}$/.test(args.activity_date || '') ? args.activity_date : todayJakarta();
+
+  const task = {
+    Subject: String(args.subject).slice(0, 255),
+    Description: [args.description, `— Dicatat via Lori AI (Slack) oleh ${user.name || ctx.userId}`]
+      .filter(Boolean)
+      .join('\n\n'),
+    ActivityDate: activityDate,
+    Status: await getClosedTaskStatus(),
+    [whoObject ? 'WhoId' : 'WhatId']: related.Id,
+    ...(user.sfUserId ? { OwnerId: user.sfUserId } : {}),
+    ...(typeValue ? { Type: typeValue } : {}),
+    ...(ACTIVITY_SUBTYPE[args.activity_type] && taskFields.get('TaskSubtype')?.createable
+      ? { TaskSubtype: ACTIVITY_SUBTYPE[args.activity_type] }
+      : {}),
+  };
+
+  const taskId = await createRecord('Task', task);
+
+  ctx.loggedActivities.push({
+    taskId,
+    requesterId: ctx.userId,
+    language: args.language || 'id',
+    activityType: args.activity_type,
+    subject: task.Subject,
+    description: args.description,
+    activityDate,
+    related: { objectName: describe.name, objectLabel: describe.label, id: related.Id, name: related[nameField] },
+    ownerName: user.sfUserId ? user.name : null,
+  });
+
+  return {
+    status: 'logged',
+    taskId,
+    relatedTo: related[nameField],
+    message: 'Saved. A card with the logged activity and an Undo button is shown to the user; reply with one short sentence.',
   };
 }
 

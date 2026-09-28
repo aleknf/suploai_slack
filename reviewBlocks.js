@@ -59,8 +59,9 @@ const REVIEW_TOOL = {
               action: { type: 'string', description: 'Concrete action starting with a verb (max ~15 words).' },
               owner: { type: 'string', description: 'Who should do it, e.g. the opportunity owner name.' },
               due: { type: 'string', description: 'When, e.g. "Minggu ini", "Sebelum 15 Okt", "This week".' },
+              due_date: { type: 'string', description: 'The same deadline as a date, YYYY-MM-DD (today or later).' },
             },
-            required: ['action', 'owner', 'due'],
+            required: ['action', 'owner', 'due', 'due_date'],
           },
           description: '3-5 next actions, most important first, each addressing a risk or gap.',
         },
@@ -85,6 +86,7 @@ const LABELS = {
     nextActions: 'Rekomendasi Next Action',
     open: 'Buka di Salesforce',
     edit: 'Edit Opportunity',
+    createTask: '➕ Buat Task',
     owner: 'Owner',
     inDays: n => `${n} hari lagi`,
     today: 'hari ini',
@@ -114,6 +116,7 @@ const LABELS = {
     nextActions: 'Recommended Next Actions',
     open: 'Open in Salesforce',
     edit: 'Edit Opportunity',
+    createTask: '➕ Create Task',
     owner: 'Owner',
     inDays: n => `in ${n} days`,
     today: 'today',
@@ -231,16 +234,28 @@ function buildOpportunityReviewBlocks(review, insights) {
   }
   blocks.push({ type: 'section', text: { type: 'mrkdwn', text: discoveryLines.join('\n') } }, { type: 'divider' });
 
+  // Each next action is its own section so it can carry a one-click "Create Task" button
   const actions = (review.next_actions || []).slice(0, 5);
-  blocks.push({
-    type: 'section',
-    text: {
-      type: 'mrkdwn',
-      text: [
-        `*✅ ${L.nextActions}*`,
-        ...actions.map((a, i) => `*${i + 1}. ${esc(a.action)}*\n      👤 ${esc(a.owner)}   📅 ${esc(a.due)}`),
-      ].join('\n'),
-    },
+  blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*✅ ${L.nextActions}*` } });
+  actions.forEach((a, i) => {
+    const dueDate = /^\d{4}-\d{2}-\d{2}$/.test(a.due_date || '') ? a.due_date : null;
+    blocks.push({
+      type: 'section',
+      block_id: `next_action_${i}`,
+      text: { type: 'mrkdwn', text: `*${i + 1}. ${esc(a.action)}*\n👤 ${esc(a.owner)}   📅 ${esc(a.due)}` },
+      accessory: {
+        type: 'button',
+        text: { type: 'plain_text', text: L.createTask, emoji: true },
+        action_id: 'sf_create_task',
+        value: JSON.stringify({
+          o: opp.Id,
+          ow: opp.OwnerId,
+          s: String(a.action).slice(0, 255),
+          d: dueDate,
+          l: review.language,
+        }).slice(0, 2000),
+      },
+    });
   });
 
   blocks.push(

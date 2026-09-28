@@ -45,6 +45,8 @@ function toolLabel(toolName, args = {}) {
       return 'Menganalisis amount, close date, discovery & aktivitas';
     case 'update_record':
       return 'Menyiapkan perubahan data';
+    case 'log_activity':
+      return 'Mencatat aktivitas ke Salesforce';
     case 'read_channel_history':
       return 'Membaca pesan channel';
     case 'join_channel':
