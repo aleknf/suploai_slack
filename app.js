@@ -15,6 +15,8 @@ const { SF_TOOLS, executeTool } = require('./sfTools');
 // Slack tools: channel history + joining channels
 const { SLACK_TOOLS, SLACK_TOOL_NAMES, executeSlackTool } = require('./slackTools');
 const { getDescribe, getRecord, updateRecord } = require('./salesforce');
+// "Reading / thinking" indicators (Assistant status + animated channel placeholder)
+const { createAssistantProgress, createChannelProgress, toolLabel } = require('./progress');
 const {
   buildRecordBlocks,
   buildEditConfirmBlocks,
@@ -169,7 +171,7 @@ function extractRecords(result) {
  * and call OpenAI again — repeating until the AI produces a final text response.
  *
  * @param {Array<Object>} messages - OpenAI-format message history (system + user + assistant turns)
- * @param {Object} ctx - Request context: { client, userId, channelId, contextChannelId }
+ * @param {Object} ctx - Request context: { client, userId, channelId, contextChannelId, progress? }
  * @param {Object} [options] - Optional overrides
  * @param {number} [options.maxIterations=8] - Safety cap to prevent infinite tool loops
  * @returns {Promise<{text: string, records: Object|null, pendingEdits: Object[]}>}
@@ -181,6 +183,8 @@ async function runWithTools(messages, ctx, { maxIterations = 8 } = {}) {
   let records = null;
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
+    if (iteration > 0) ctx.progress?.thinking();
+
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       n: 1,
@@ -208,6 +212,7 @@ async function runWithTools(messages, ctx, { maxIterations = 8 } = {}) {
       let toolResult;
       try {
         const toolArgs = JSON.parse(toolCall.function.arguments || '{}');
+        ctx.progress?.step(toolLabel(toolName, toolArgs));
         toolResult = SLACK_TOOL_NAMES.has(toolName)
           ? await executeSlackTool(toolName, toolArgs, ctx)
           : await executeTool(toolName, toolArgs, ctx);
@@ -378,12 +383,13 @@ const assistant = new Assistant({
     }
   },
 
-  userMessage: async ({ client, logger, message, getThreadContext, say, setTitle, setStatus }) => {
+  userMessage: async ({ client, logger, message, getThreadContext, say, setTitle }) => {
     const { channel, thread_ts } = message;
+    const progress = createAssistantProgress({ client, channel, threadTs: thread_ts });
 
     try {
       await setTitle(message.text);
-      await setStatus('is typing....biatch');
+      await progress.start();
 
       //add identity check
       const identityQuestions = ['who are you', 'siapa kamu','what is your name', 'what is your identity', 'what are you?'];
@@ -406,7 +412,13 @@ const assistant = new Assistant({
 
       // The channel the user is viewing when they opened the assistant ("current channel")
       const threadContext = await getThreadContext();
-      const ctx = { client, userId: message.user, channelId: channel, contextChannelId: threadContext?.channel_id };
+      const ctx = {
+        client,
+        userId: message.user,
+        channelId: channel,
+        contextChannelId: threadContext?.channel_id,
+        progress,
+      };
 
       // Build the message array: system prompt + thread history + current user message
       const messages = [
@@ -440,21 +452,25 @@ app.assistant(assistant);
  * Handles @mention events in any channel. Lori replies in a thread (continuing the thread's context
  * when mentioned inside one) and can query Salesforce, read channel history or summarize the channel.
  */
-app.event('app_mention', async ({ event, client, say, logger }) => {
+app.event('app_mention', async ({ event, client, logger }) => {
   const threadTs = event.thread_ts || event.ts;
+  const progress = createChannelProgress({ client, channel: event.channel, threadTs, messageTs: event.ts, logger });
 
   try {
+    await progress.start();
+
     // Mentioned inside a thread: include the earlier thread messages as context
     let history = [];
     if (event.thread_ts) {
       const thread = await client.conversations.replies({ channel: event.channel, ts: event.thread_ts, limit: 50 });
       history = thread.messages
-        .filter(m => m.ts !== event.ts)
+        // Skip the question itself and this request's own "thinking" placeholder
+        .filter(m => m.ts !== event.ts && !m.text?.includes('Lori sedang'))
         .slice(-10)
         .map(toHistoryMessage);
     }
 
-    const ctx = { client, userId: event.user, channelId: event.channel, contextChannelId: event.channel };
+    const ctx = { client, userId: event.user, channelId: event.channel, contextChannelId: event.channel, progress };
     const messages = [
       { role: 'system', content: buildSystemPrompt(ctx) },
       ...history,
@@ -462,10 +478,10 @@ app.event('app_mention', async ({ event, client, say, logger }) => {
     ];
 
     const result = await runWithTools(messages, ctx);
-    await say({ ...(await buildReplyMessage(result, event.user)), thread_ts: threadTs });
+    await progress.finish(await buildReplyMessage(result, event.user));
   } catch (error) {
     logger.error('Error handling app_mention:', error);
-    await say({ text: 'Sorry, something went wrong processing your request.', thread_ts: threadTs });
+    await progress.fail('Sorry, something went wrong processing your request.');
   }
 });
 

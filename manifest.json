@@ -107,7 +107,8 @@
                 "channels:read",
                 "groups:read",
                 "mpim:history",
-                "mpim:read"
+                "mpim:read",
+                "reactions:write"
             ]
         },
         "pkce_enabled": false
