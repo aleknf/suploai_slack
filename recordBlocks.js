@@ -7,7 +7,7 @@
  *   - the Edit modal and parsing of its submission
  */
 
-const { sfUrl, getDescribe } = require('./salesforce');
+const { sfUrl, getDescribe, htmlToText } = require('./salesforce');
 
 const MAX_CARDS = 15;
 const MAX_CARD_FIELDS = 10;
@@ -146,7 +146,7 @@ function formatValue(value, type, currency = DEFAULT_CURRENCY) {
     case 'multipicklist':
       return escapeMrkdwn(String(value).split(';').join(', '));
     default:
-      return escapeMrkdwn(truncate(String(value), 250));
+      return escapeMrkdwn(truncate(String(htmlToText(value)), 250));
   }
 }
 

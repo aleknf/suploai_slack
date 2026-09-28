@@ -131,7 +131,14 @@ function mdToSlack(text) {
 }
 
 // Tools whose results are rendered as record cards under the AI's reply
-const RECORD_TOOLS = new Set(['query_records', 'search_records', 'get_record_details', 'get_case_details', 'query_cases']);
+const RECORD_TOOLS = new Set([
+  'query_records',
+  'search_records',
+  'get_record_details',
+  'get_case_details',
+  'query_cases',
+  'analyze_opportunity',
+]);
 
 /**
  * Pulls the records out of a Salesforce tool result so they can be rendered as cards.
@@ -147,6 +154,9 @@ function extractRecords(result) {
     return { records, totalSize: records.length };
   }
   if (Array.isArray(data.records)) return { records: data.records, totalSize: data.totalSize };
+  // analyze_opportunity: the analyzed deal, or the candidates when the name was ambiguous
+  if (data.opportunity) return { records: [data.opportunity], totalSize: 1 };
+  if (Array.isArray(data.candidates)) return { records: data.candidates, totalSize: data.candidates.length };
   if (data.attributes) return { records: [data], totalSize: 1 };
   return null;
 }
@@ -294,6 +304,17 @@ Salesforce — editing records:
 - Use update_record to change fields. It shows the user a Save/Cancel confirmation card; nothing is saved until they click Save. Do not ask for confirmation in text.
 - Find the record Id first when needed. If several records match, list the candidates and ask which one.
 - Ids of records shown earlier are in their Salesforce links in the conversation history.
+
+Opportunity summary & next actions:
+- When asked for a summary, conclusion, health, risk or next action of an opportunity, call analyze_opportunity and base your answer on its data (amount, close date, discovery, activities, history, signals).
+- Answer in this structure (the opportunity card is shown automatically below, so do not repeat its fields):
+  *Kesimpulan* — health label 🟢 On track / 🟡 Needs attention / 🔴 At risk, then 2-3 sentences explaining why.
+  *Amount & Close Date* — is the amount set and realistic for the stage/probability; days to close, overdue close date, how often it was pushed.
+  *Discovery* — review the Discovery Information fields (Salesforce Implementation Objective, Current Tools, Integration, Expected Impact, Implementation Timeline, Standard Business Process, Quip Link): what is known and which are empty. Discovery Check unchecked means discovery has not been validated yet — call it out.
+  *Activity* — last interaction and how long ago, activity in the last 30 days, upcoming or overdue tasks.
+  *Next Actions* — 3-5 numbered, concrete actions (who/what/by when), most important first, each tied to a gap or risk above.
+- Use the signals, do not invent facts. Flag red flags: close date passed or pushed repeatedly, no activity for 14+ days, nothing scheduled, missing amount, empty discovery, long time in the same stage.
+- If the user wants to act on a recommendation (e.g. move the close date), use update_record.
 
 Slack channels:
 - read_channel_history reads the latest messages (max 50) of a channel — use it to summarize a channel or answer questions about its discussion. Without a channel it reads the current channel.

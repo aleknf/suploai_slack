@@ -24,6 +24,8 @@ const {
   getActivityHistory,
   getCaseDetails,
   queryCases,
+  findOpportunitiesByName,
+  getOpportunityInsights,
 } = require('./salesforce');
 
 // Objects searched when the user gives a keyword without naming an object
@@ -230,6 +232,31 @@ const SF_TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'analyze_opportunity',
+      description:
+        'Collects everything needed to assess one Opportunity and recommend next actions: amount, close date, ' +
+        'stage, discovery data, activities (tasks/events), stage/close-date history and pre-computed health signals. ' +
+        'Use it when the user asks for a summary, conclusion, health check, risk or next action of an opportunity.',
+      parameters: {
+        type: 'object',
+        properties: {
+          opportunity_id: {
+            type: 'string',
+            description: 'The Opportunity Id, if known.',
+          },
+          opportunity_name: {
+            type: 'string',
+            description: 'Full or partial Opportunity name, used when the Id is not known.',
+          },
+        },
+        required: [],
+      },
+    },
+  },
+
+  {
+    type: 'function',
+    function: {
       name: 'update_record',
       description:
         'Proposes an edit to fields of an existing Salesforce record. The change is NOT saved immediately: ' +
@@ -323,6 +350,22 @@ async function executeTool(toolName, args, ctx) {
         args.limit || 20
       );
       return JSON.stringify(result);
+    }
+
+    case 'analyze_opportunity': {
+      let oppId = args.opportunity_id;
+      if (!oppId) {
+        if (!args.opportunity_name) return JSON.stringify({ error: 'Provide opportunity_id or opportunity_name.' });
+        const candidates = await findOpportunitiesByName(args.opportunity_name);
+        if (candidates.length === 0) return JSON.stringify({ error: `No opportunity matches "${args.opportunity_name}".` });
+        const exact = candidates.filter(c => c.Name.toLowerCase() === args.opportunity_name.toLowerCase());
+        if (exact.length === 1) candidates.splice(0, candidates.length, exact[0]);
+        if (candidates.length > 1) {
+          return JSON.stringify({ status: 'multiple_matches', message: 'Ask the user which one.', candidates });
+        }
+        oppId = candidates[0].Id;
+      }
+      return JSON.stringify(await getOpportunityInsights(oppId));
     }
 
     case 'update_record':

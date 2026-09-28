@@ -396,8 +396,229 @@ async function queryCases({ status, priority, accountName, contactName, subjectK
   };
 }
 
+// Opportunity fields used for deal analysis (kept only when present/visible in the org)
+const INSIGHT_OPP_FIELDS = [
+  'Id', 'Name', 'Account.Name', 'Owner.Name', 'StageName', 'Amount', 'Probability', 'ExpectedRevenue',
+  'CloseDate', 'ForecastCategoryName', 'NextStep', 'Description', 'Type', 'LeadSource', 'CreatedDate',
+  'LastActivityDate', 'IsClosed', 'IsWon',
+];
+
+// Field types worth sending to the AI for discovery records
+const DISCOVERY_FIELD_TYPES = new Set([
+  'string', 'textarea', 'picklist', 'multipicklist', 'boolean', 'date', 'datetime', 'double', 'currency', 'percent', 'int',
+]);
+
+// "Discovery Information" section of the Opportunity layout
+const DISCOVERY_FIELDS = [
+  'Salesforce_Implementation_Objective__c',
+  'Current_Tools__c',
+  'Integration__c',
+  'Expected_Impact__c',
+  'Implementation_Timeline__c',
+  'Standard_Business_Process__c',
+  'Quip_Link__c',
+  'Discovery_Check__c',
+];
+
+const DISCOVERY_PATTERN = /discover/i;
+
+// Known fields keep their layout order; auto-detected ones come after
+const discoveryRank = name => (DISCOVERY_FIELDS.includes(name) ? DISCOVERY_FIELDS.indexOf(name) : DISCOVERY_FIELDS.length);
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+const escapeSoql = value => String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+
+// Today as YYYY-MM-DD in Jakarta time, so "days to close" matches what users see
+const todayJakarta = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jakarta' });
+
+const daysBetween = (from, to) => Math.round((Date.parse(to) - Date.parse(from)) / DAY_MS);
+
+// Rich text fields come back as HTML — reduce to plain text lines for the AI
+const htmlToText = value =>
+  typeof value === 'string' && /<[a-z][\s\S]*>/i.test(value)
+    ? value
+        .replace(/<br\s*\/?>|<\/(p|li|div)>/gi, '\n')
+        .replace(/<li[^>]*>/gi, '• ')
+        .replace(/<[^>]+>/g, '')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/\n{2,}/g, '\n')
+        .trim()
+    : value;
+
+const trimText = (value, max = 500) => {
+  const text = htmlToText(value);
+  return typeof text === 'string' && text.length > max ? `${text.slice(0, max)}…` : text;
+};
+
+/**
+ * Finds Opportunity candidates by partial name (used when the user gives a name instead of an Id).
+ *
+ * @param {string} name - Partial opportunity name
+ * @returns {Promise<Object[]>} Up to 5 matching opportunities
+ */
+async function findOpportunitiesByName(name) {
+  const { records } = await runSOQL(
+    `SELECT Id, Name, Account.Name, StageName, Amount, CloseDate FROM Opportunity
+     WHERE Name LIKE '%${escapeSoql(name)}%' ORDER BY IsClosed ASC, CloseDate DESC LIMIT 5`
+  );
+  return records;
+}
+
+/**
+ * Loads discovery data of an opportunity: Opportunity fields whose name/label mentions "discovery",
+ * plus records of child objects whose name mentions "discovery" (e.g. Discovery__c with a lookup to Opportunity).
+ */
+async function getDiscoveryData(oppDescribe, oppId) {
+  // Known discovery fields first, then any other field whose name/label mentions "discovery"
+  const fieldNames = oppDescribe.fields
+    .filter(f => DISCOVERY_FIELDS.includes(f.name) || DISCOVERY_PATTERN.test(f.name) || DISCOVERY_PATTERN.test(f.label))
+    .sort((a, b) => discoveryRank(a.name) - discoveryRank(b.name))
+    .map(f => f.name);
+
+  const relationships = (oppDescribe.childRelationships || []).filter(
+    r => r.relationshipName && (DISCOVERY_PATTERN.test(r.childSObject) || DISCOVERY_PATTERN.test(r.relationshipName))
+  );
+
+  const related = [];
+  for (const rel of relationships.slice(0, 3)) {
+    try {
+      const childDescribe = await getDescribe(rel.childSObject);
+      const fields = childDescribe.fields
+        .filter(f => DISCOVERY_FIELD_TYPES.has(f.type) && !f.name.startsWith('System') && f.name !== 'IsDeleted')
+        .slice(0, 25)
+        .map(f => f.name);
+      const { records } = await runSOQL(
+        `SELECT Id, ${[...new Set(['Name', ...fields])].filter(f => childDescribe.fields.some(d => d.name === f)).join(', ')} ` +
+          `FROM ${rel.childSObject} WHERE ${rel.field} = '${oppId}' ORDER BY CreatedDate DESC LIMIT 10`
+      );
+      related.push({
+        object: childDescribe.label,
+        records: records.map(({ attributes, ...rest }) =>
+          Object.fromEntries(Object.entries(rest).map(([k, v]) => [k, trimText(v)]))
+        ),
+      });
+    } catch (_) {
+      // Child object not queryable for this user — skip it
+    }
+  }
+
+  return { fieldNames, related };
+}
+
+/**
+ * Gathers everything needed to judge an opportunity's health and recommend next actions:
+ * key fields (amount, close date, stage), discovery data, Tasks/Events and stage/close-date history,
+ * plus pre-computed signals so the AI does not have to do date math.
+ *
+ * @param {string} oppId - 15 or 18-character Opportunity Id
+ * @returns {Promise<Object>} { opportunity, discovery, activities, history, signals }
+ * @throws {Error} If the opportunity is not found
+ */
+async function getOpportunityInsights(oppId) {
+  const describe = await getDescribe('Opportunity');
+  const available = new Set(describe.fields.map(f => f.name));
+  const relationshipNames = new Set(describe.fields.map(f => f.relationshipName).filter(Boolean));
+
+  const discoveryMeta = await getDiscoveryData(describe, oppId);
+  const fields = [...INSIGHT_OPP_FIELDS, ...discoveryMeta.fieldNames].filter(f =>
+    f.includes('.') ? relationshipNames.has(f.split('.')[0]) : available.has(f)
+  );
+
+  const oppResult = await runSOQL(`SELECT ${[...new Set(fields)].join(', ')} FROM Opportunity WHERE Id = '${escapeSoql(oppId)}'`);
+  const opportunity = oppResult.records[0];
+  if (!opportunity) throw new Error(`Opportunity not found: ${oppId}`);
+
+  const [tasks, events, history] = await Promise.all([
+    runSOQL(
+      `SELECT Id, Subject, Status, IsClosed, Priority, ActivityDate, Type, TaskSubtype, Description,
+              Who.Name, Owner.Name, CreatedDate
+       FROM Task WHERE WhatId = '${opportunity.Id}' ORDER BY CreatedDate DESC LIMIT 30`
+    ).then(r => r.records, () => []),
+    runSOQL(
+      `SELECT Id, Subject, StartDateTime, EndDateTime, Type, Description, Who.Name, Owner.Name
+       FROM Event WHERE WhatId = '${opportunity.Id}' ORDER BY StartDateTime DESC LIMIT 30`
+    ).then(r => r.records, () => []),
+    runSOQL(
+      `SELECT CreatedDate, StageName, Amount, CloseDate, Probability FROM OpportunityHistory
+       WHERE OpportunityId = '${opportunity.Id}' ORDER BY CreatedDate DESC LIMIT 50`
+    ).then(r => r.records.reverse(), () => []),
+  ]);
+
+  const today = todayJakarta();
+  const now = Date.now();
+
+  // Completed interactions: closed tasks (dated by due date or creation) and events that already started
+  const pastDates = [
+    ...tasks.filter(t => t.IsClosed).map(t => t.ActivityDate || t.CreatedDate.slice(0, 10)),
+    ...events.filter(e => Date.parse(e.StartDateTime) <= now).map(e => e.StartDateTime.slice(0, 10)),
+  ].sort();
+  const lastActivityDate = pastDates[pastDates.length - 1] || opportunity.LastActivityDate || null;
+
+  const upcomingTasks = tasks.filter(t => !t.IsClosed && (!t.ActivityDate || t.ActivityDate >= today));
+  const overdueTasks = tasks.filter(t => !t.IsClosed && t.ActivityDate && t.ActivityDate < today);
+  const upcomingEvents = events.filter(e => Date.parse(e.StartDateTime) > now);
+
+  // Count how often the close date was moved later, and how long the deal sits in its current stage
+  let closeDatePushes = 0;
+  let stageSince = opportunity.CreatedDate?.slice(0, 10);
+  for (let i = 1; i < history.length; i++) {
+    if (history[i].CloseDate && history[i - 1].CloseDate && history[i].CloseDate > history[i - 1].CloseDate)
+      closeDatePushes++;
+    if (history[i].StageName !== history[i - 1].StageName) stageSince = history[i].CreatedDate.slice(0, 10);
+  }
+
+  // Keyed by field label so the AI reads "Current Tools" rather than API names
+  const labelOf = name => describe.fields.find(f => f.name === name)?.label || name;
+  const discoveryFields = Object.fromEntries(
+    discoveryMeta.fieldNames.map(f => [labelOf(f), trimText(opportunity[f], 1500)])
+  );
+  const filledDiscoveryFields = Object.values(discoveryFields).filter(v => v !== null && v !== '' && v !== false);
+
+  const signals = {
+    today,
+    daysToClose: opportunity.CloseDate ? daysBetween(today, opportunity.CloseDate) : null,
+    closeDatePassedWhileOpen: Boolean(!opportunity.IsClosed && opportunity.CloseDate && opportunity.CloseDate < today),
+    closeDatePushes,
+    daysInCurrentStage: stageSince ? daysBetween(stageSince, today) : null,
+    ageDays: opportunity.CreatedDate ? daysBetween(opportunity.CreatedDate.slice(0, 10), today) : null,
+    amountMissing: opportunity.Amount === null || opportunity.Amount === undefined,
+    lastActivityDate,
+    daysSinceLastActivity: lastActivityDate ? daysBetween(lastActivityDate, today) : null,
+    activitiesLast30Days: pastDates.filter(d => daysBetween(d, today) <= 30).length,
+    upcomingActivities: upcomingTasks.length + upcomingEvents.length,
+    overdueTasks: overdueTasks.length,
+    discoveryFieldsFound: discoveryMeta.fieldNames.length,
+    discoveryFieldsFilled: filledDiscoveryFields.length,
+    discoveryRecords: discoveryMeta.related.reduce((sum, r) => sum + r.records.length, 0),
+  };
+
+  const compactActivity = ({ attributes, Who, Owner, Description, ...rest }) => ({
+    ...rest,
+    who: Who?.Name,
+    owner: Owner?.Name,
+    description: trimText(Description, 300),
+  });
+
+  return {
+    opportunity,
+    discovery: { fields: discoveryFields, related: discoveryMeta.related },
+    activities: {
+      tasks: tasks.slice(0, 15).map(compactActivity),
+      events: events.slice(0, 15).map(compactActivity),
+    },
+    history: history.map(({ attributes, ...rest }) => rest),
+    signals,
+  };
+}
+
 module.exports = {
   sfUrl,
+  htmlToText,
   getSalesforceToken,
   getDescribe,
   describeObject,
@@ -406,6 +627,8 @@ module.exports = {
   runSOSL,
   getRecord,
   getActivityHistory,
+  findOpportunitiesByName,
+  getOpportunityInsights,
   getCaseDetails,
   queryCases,
 };
