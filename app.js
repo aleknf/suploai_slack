@@ -1,6 +1,8 @@
 const { App, LogLevel, Assistant } = require('@slack/bolt');
 const { WebClient } = require('@slack/web-api');
 const { config } = require('dotenv');
+// Load .env before the Salesforce/Slack modules read process.env at require time
+config();
 const { OpenAI } = require('openai');
 // Removed unused ESM import that caused Jest compatibility issues
 // const axios = require('axios');
@@ -8,14 +10,27 @@ const { OpenAI } = require('openai');
 //const mammoth = require('mammoth');
 const fetch = require('node-fetch'); //use npm install node-fetch@2
 
-// Salesforce read tools: schema definitions for OpenAI function calling + executor dispatcher
+// Salesforce tools: schema definitions for OpenAI function calling + executor dispatcher
 const { SF_TOOLS, executeTool } = require('./sfTools');
+// Slack tools: channel history + joining channels
+const { SLACK_TOOLS, SLACK_TOOL_NAMES, executeSlackTool } = require('./slackTools');
+const { getDescribe, getRecord, updateRecord } = require('./salesforce');
+const {
+  buildRecordBlocks,
+  buildEditConfirmBlocks,
+  buildEditModal,
+  buildLoadingModal,
+  pickEditableFields,
+  parseEditSubmission,
+  describeChanges,
+  recordTitle,
+  recordUrl,
+  textToBlocks,
+} = require('./recordBlocks');
 
 //change url for sandbox or prod
 const sfUrl = 'https://langitkreasisolusindo.my.salesforce.com';
 // const sfUrl = 'https://langitkreasisolusindo--devlks.sandbox.my.salesforce.com';
-
-config();
 
 /** Initialization Slack*/
 const app = new App({
@@ -72,7 +87,7 @@ function getTimestampForTime(hours, minutes) {
  * Conversions:
  *   **bold**        → *bold*
  *   __bold__        → *bold*
- *   *italic*        → _italic_   (single asterisk)
+ *   *bold*          → *bold*     (single asterisk is already Slack bold)
  *   _italic_        → _italic_   (already correct)
  *   `code`          → `code`     (already correct)
  *   ```block```     → ```block``` (already correct)
@@ -100,10 +115,6 @@ function mdToSlack(text) {
     .replace(/\*\*(.+?)\*\*/g, '*$1*')
     .replace(/__(.+?)__/g, '*$1*')
 
-    // Italic: *text* (single) → _text_  (only if not already converted from bold)
-    // Use a negative lookbehind/ahead to avoid touching already-converted *bold*
-    .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '_$1_')
-
     // Markdown links: [text](url) → <url|text>
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<$2|$1>')
 
@@ -119,41 +130,62 @@ function mdToSlack(text) {
     .replace(/[ \t]+$/gm, '');
 }
 
+// Tools whose results are rendered as record cards under the AI's reply
+const RECORD_TOOLS = new Set(['query_records', 'search_records', 'get_record_details', 'get_case_details', 'query_cases']);
+
 /**
- * Runs an OpenAI chat completion with Salesforce tool support.
+ * Pulls the records out of a Salesforce tool result so they can be rendered as cards.
+ *
+ * @param {string} result - JSON string returned by executeTool
+ * @returns {{records: Object[], totalSize: number}|null}
+ */
+function extractRecords(result) {
+  const data = JSON.parse(result);
+  if (Array.isArray(data)) {
+    // search_records: [{ objectName, records }]
+    const records = data.flatMap(group => group.records || []);
+    return { records, totalSize: records.length };
+  }
+  if (Array.isArray(data.records)) return { records: data.records, totalSize: data.totalSize };
+  if (data.attributes) return { records: [data], totalSize: 1 };
+  return null;
+}
+
+/**
+ * Runs an OpenAI chat completion with Salesforce + Slack tool support.
  *
  * This is the core AI loop used by both the Assistant DM thread and the @mention handler.
- * It handles multi-step tool calls: if OpenAI requests a tool, we execute it against
- * Salesforce, append the result, and call OpenAI again — repeating until the AI produces
- * a final text response with no further tool calls.
+ * It handles multi-step tool calls: if OpenAI requests a tool, we execute it, append the result,
+ * and call OpenAI again — repeating until the AI produces a final text response.
  *
  * @param {Array<Object>} messages - OpenAI-format message history (system + user + assistant turns)
+ * @param {Object} ctx - Request context: { client, userId, channelId, contextChannelId }
  * @param {Object} [options] - Optional overrides
- * @param {number} [options.maxIterations=5] - Safety cap to prevent infinite tool loops
- * @returns {Promise<string>} The final assistant text response to send to the user
- * @throws {Error} If OpenAI or any tool call fails
+ * @param {number} [options.maxIterations=8] - Safety cap to prevent infinite tool loops
+ * @returns {Promise<{text: string, records: Object|null, pendingEdits: Object[]}>}
+ *   Final reply text, the records of the last data query (rendered as cards) and edits awaiting confirmation
+ * @throws {Error} If OpenAI fails
  */
-async function runWithTools(messages, { maxIterations = 5 } = {}) {
-  let iteration = 0;
+async function runWithTools(messages, ctx, { maxIterations = 8 } = {}) {
+  ctx.pendingEdits = [];
+  let records = null;
 
-  while (iteration < maxIterations) {
-    iteration++;
-
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       n: 1,
       messages,
-      tools: SF_TOOLS,
+      tools: [...SF_TOOLS, ...SLACK_TOOLS],
       // "auto" lets the model decide whether to call a tool or respond directly
       tool_choice: 'auto',
-      temperature: 0.7,
+      temperature: 0.3,
     });
 
     const choice = response.choices[0];
 
     // If the model chose to respond directly (no tool calls), return the text
     if (choice.finish_reason === 'stop' || !choice.message.tool_calls) {
-      return mdToSlack(choice.message.content);
+      return { text: mdToSlack(choice.message.content), records, pendingEdits: ctx.pendingEdits };
     }
 
     // Append the assistant's tool-calling message to the conversation history
@@ -162,14 +194,19 @@ async function runWithTools(messages, { maxIterations = 5 } = {}) {
     // Execute each tool call the AI requested (may be multiple in one turn)
     for (const toolCall of choice.message.tool_calls) {
       const toolName = toolCall.function.name;
-      const toolArgs = JSON.parse(toolCall.function.arguments);
 
       let toolResult;
       try {
-        toolResult = await executeTool(toolName, toolArgs);
+        const toolArgs = JSON.parse(toolCall.function.arguments || '{}');
+        toolResult = SLACK_TOOL_NAMES.has(toolName)
+          ? await executeSlackTool(toolName, toolArgs, ctx)
+          : await executeTool(toolName, toolArgs, ctx);
+
+        // Remember the latest record set; it is shown as cards with the final answer
+        if (RECORD_TOOLS.has(toolName)) records = extractRecords(toolResult) || records;
       } catch (err) {
-        // Return error as a tool result so the AI can explain it to the user
-        toolResult = JSON.stringify({ error: err.message });
+        // Return error as a tool result so the AI can explain it or retry
+        toolResult = JSON.stringify({ error: err.data?.error || err.message });
       }
 
       // Append the tool result as a "tool" role message — required by OpenAI API
@@ -182,7 +219,58 @@ async function runWithTools(messages, { maxIterations = 5 } = {}) {
   }
 
   // Fallback if we hit the iteration cap (shouldn't happen in normal usage)
-  return 'Sorry, I ran into an issue retrieving that information. Please try again.';
+  return {
+    text: 'Sorry, I ran into an issue retrieving that information. Please try again.',
+    records: null,
+    pendingEdits: [],
+  };
+}
+
+/**
+ * Turns the AI result into a Slack message: reply text, then edit confirmation cards or record cards.
+ *
+ * @param {{text: string, records: Object|null, pendingEdits: Object[]}} result - Output of runWithTools
+ * @param {string} requesterId - Slack user Id; only they can confirm proposed edits
+ * @returns {Promise<{text: string, blocks: Object[]}>} chat.postMessage arguments
+ */
+async function buildReplyMessage({ text, records, pendingEdits }, requesterId) {
+  const blocks = textToBlocks(text);
+
+  for (const edit of pendingEdits) {
+    blocks.push(...(await buildEditConfirmBlocks(edit, requesterId)));
+  }
+
+  // Skip record cards when an edit is pending — the lookup query would only add noise
+  if (pendingEdits.length === 0 && records?.records.length && blocks.length < 45) {
+    blocks.push(...(await buildRecordBlocks(records.records, { totalSize: records.totalSize, maxBlocks: 50 - blocks.length })));
+  }
+
+  return { text: text || 'Here is what I found.', blocks: blocks.slice(0, 50) };
+}
+
+/**
+ * Collects the visible text of a message's blocks (including record links, which carry the record Ids)
+ * so earlier record cards stay in the AI's conversation history.
+ */
+function blocksToText(blocks = []) {
+  const parts = [];
+  for (const block of blocks) {
+    if (block.text?.text) parts.push(block.text.text);
+    for (const field of block.fields || []) parts.push(field.text);
+    for (const el of block.type === 'context' ? block.elements : []) if (el.text) parts.push(el.text);
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Maps a Slack message to an OpenAI history message.
+ */
+function toHistoryMessage(m) {
+  const content = m.bot_id && m.blocks?.length ? blocksToText(m.blocks) : m.text;
+  return {
+    role: m.bot_id ? 'assistant' : 'user',
+    content: (content || '').slice(0, 4000),
+  };
 }
 
 /**
@@ -191,13 +279,25 @@ async function runWithTools(messages, { maxIterations = 5 } = {}) {
  * Keep this concise — it is prepended to every message array and counts toward token usage.
  */
 const DEFAULT_SYSTEM_CONTENT = `You are Lori, an assistant in a Slack workspace for Langit Kreasi Solusindo (LKS).
-You help users with general questions AND with querying Salesforce data (Contacts, Leads, Opportunities, Activities, Projects, Cases, and more).
+You help users with general questions, Salesforce data (Contacts, Leads, Opportunities, Accounts, Activities, Projects, Cases, and more) and Slack channels.
 
-When a user asks about Salesforce records:
-- If they do not specify which object (e.g. Contact vs Lead), ask them first before searching.
-- Use describe_salesforce_object to discover available fields before writing SOQL queries.
-- Use search_records for keyword searches; use query_records for structured filters.
-- Present results clearly and concisely — avoid dumping raw JSON.
+Salesforce — finding records:
+- Act immediately. NEVER ask which object to search and never ask for confirmation before reading data. Infer the object from the user's words (e.g. "opportunity" → Opportunity, "kontak" → Contact, "proyek" → Project__c). Only ask a question when the request is truly impossible to interpret.
+- Use query_records (SOQL) for filters and search_records (SOSL) for a name/keyword. For standard objects write SOQL directly with well-known fields; call describe_salesforce_object only for custom objects/fields or after a query error.
+- Always SELECT Id, the record name and the fields relevant to the question (e.g. Opportunity: Id, Name, Account.Name, StageName, Amount, CloseDate, Owner.Name). Default to LIMIT 20 with a sensible ORDER BY.
+- "Open" opportunities means IsClosed = false. A year like "2026" filters CloseDate (CALENDAR_YEAR(CloseDate) = 2026) unless another date field is named. Use SOQL date literals (THIS_MONTH, LAST_N_DAYS:30, NEXT_QUARTER, ...) for relative dates.
+- If a query fails, fix it (describe the object if needed) and retry instead of giving up.
+- The records returned by your last query are displayed automatically as cards under your message (with links and an Edit button). Keep your text short: one or two sentences of summary or insight (count, totals, notable items). Do NOT list the records or their fields again.
+- For counts and totals use aggregate SOQL (COUNT(), SUM(Amount)) and state the result.
+
+Salesforce — editing records:
+- Use update_record to change fields. It shows the user a Save/Cancel confirmation card; nothing is saved until they click Save. Do not ask for confirmation in text.
+- Find the record Id first when needed. If several records match, list the candidates and ask which one.
+- Ids of records shown earlier are in their Salesforce links in the conversation history.
+
+Slack channels:
+- read_channel_history reads the latest messages (max 50) of a channel — use it to summarize a channel or answer questions about its discussion. Without a channel it reads the current channel.
+- join_channel joins a public channel. For private channels, tell the user to run /invite @Lori AI in that channel.
 
 Formatting rules (IMPORTANT — you are responding in Slack):
 - Use *bold* for emphasis (NOT **double asterisk**).
@@ -206,8 +306,19 @@ Formatting rules (IMPORTANT — you are responding in Slack):
 - Do NOT use markdown headings (# ## ###) — use *bold text* instead.
 - Do NOT use [text](url) links — use plain URLs or <url|text> format.
 - Keep Slack syntax like <@USER_ID> or <#CHANNEL_ID> as-is.
+- Reply in the user's language.
 - Avoid greetings unless explicitly requested.
 - Respond professionally unless asked otherwise.`;
+
+/**
+ * Adds per-request facts (date, user, channel) to the system prompt.
+ */
+function buildSystemPrompt(ctx) {
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Jakarta' });
+  const lines = [`Today is ${today} (Asia/Jakarta).`, `The user talking to you is <@${ctx.userId}>.`];
+  if (ctx.contextChannelId) lines.push(`The current channel is <#${ctx.contextChannelId}>.`);
+  return `${DEFAULT_SYSTEM_CONTENT}\n\n${lines.join('\n')}`;
+}
 
 // Assistant configuration and event handlers
 const assistant = new Assistant({
@@ -220,11 +331,8 @@ const assistant = new Assistant({
 
       const prompts = [
         {
-          title: 'This is a suggested prompt',
-          message:
-            'When a user clicks a prompt, the resulting prompt message text can be passed ' +
-            'directly to your LLM for processing.\n\nAssistant, please create some helpful prompts ' +
-            'I can provide to my users.',
+          title: 'Open opportunities this year',
+          message: 'Show open opportunities closing this year',
         },
       ];
 
@@ -269,25 +377,26 @@ const assistant = new Assistant({
         oldest: thread_ts,
       });
 
-      // Filter out the initial greeting and keep only the last 10 messages for context
+      // Keep the last 10 earlier messages for context (the current message is appended below)
       const threadHistory = thread.messages
-        .filter(m => m.text !== 'Hi, sorry Lori lagi ngehang....')
+        .filter(m => m.ts !== message.ts && m.text !== 'Hi, sorry Lori lagi ngehang....')
         .slice(-10)
-        .map(m => ({
-          role: m.bot_id ? 'assistant' : 'user',
-          content: m.text,
-        }));
+        .map(toHistoryMessage);
+
+      // The channel the user is viewing when they opened the assistant ("current channel")
+      const threadContext = await getThreadContext();
+      const ctx = { client, userId: message.user, channelId: channel, contextChannelId: threadContext?.channel_id };
 
       // Build the message array: system prompt + thread history + current user message
       const messages = [
-        { role: 'system', content: DEFAULT_SYSTEM_CONTENT },
+        { role: 'system', content: buildSystemPrompt(ctx) },
         ...threadHistory,
         { role: 'user', content: message.text },
       ];
 
-      // Use the tool-calling loop so the AI can query Salesforce if needed
-      const responseContent = await runWithTools(messages);
-      await say({ text: responseContent });
+      // Use the tool-calling loop so the AI can query Salesforce / Slack if needed
+      const result = await runWithTools(messages, ctx);
+      await say(await buildReplyMessage(result, message.user));
     } catch (e) {
       logger.error('Error processing user message:', e);
       await say({ text: 'Something unexpected happened while processing your request' });
@@ -307,63 +416,185 @@ app.assistant(assistant);
 })();
 
 /**
- * Handles @mention events in any channel.
- * Two modes:
- *   1. Summarize — if the user says "summarize" or "summary", fetch recent channel messages
- *      and ask the AI to produce a summary (no Salesforce tools needed here).
- *   2. General — pass the message through the full tool-calling loop so the AI can
- *      answer general questions or query Salesforce as needed.
+ * Handles @mention events in any channel. Lori replies in a thread (continuing the thread's context
+ * when mentioned inside one) and can query Salesforce, read channel history or summarize the channel.
  */
-app.event('app_mention', async ({ event, client, say }) => {
-  const messageText = event.text.toLowerCase();
-  const isSummarizeRequest = messageText.includes('summarize') || messageText.includes('summary');
+app.event('app_mention', async ({ event, client, say, logger }) => {
+  const threadTs = event.thread_ts || event.ts;
 
-  if (isSummarizeRequest) {
-    try {
-      // Fetch the last 50 messages in the channel to build the summary prompt
-      const channelHistory = await client.conversations.history({
-        channel: event.channel,
-        limit: 50,
-      });
-
-      let llmPrompt = `Please generate a brief summary of the following messages from Slack channel <#${event.channel}>:`;
-      for (const m of channelHistory.messages.reverse()) {
-        if (m.user) llmPrompt += `\n<@${m.user}> says: ${m.text}`;
-      }
-
-      // Summarization is a single-shot request — no Salesforce tools needed
-      const llmResponse = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        n: 1,
-        messages: [
-          { role: 'system', content: DEFAULT_SYSTEM_CONTENT },
-          { role: 'user', content: llmPrompt },
-        ],
-      });
-
-      await say({ text: llmResponse.choices[0].message.content });
-    } catch (error) {
-      console.error('Error summarizing channel:', error);
-      await say({ text: 'Sorry, I had trouble summarizing this channel.' });
+  try {
+    // Mentioned inside a thread: include the earlier thread messages as context
+    let history = [];
+    if (event.thread_ts) {
+      const thread = await client.conversations.replies({ channel: event.channel, ts: event.thread_ts, limit: 50 });
+      history = thread.messages
+        .filter(m => m.ts !== event.ts)
+        .slice(-10)
+        .map(toHistoryMessage);
     }
-  } else {
-    try {
-      // For all other @mentions, run the full tool-calling loop so the AI
-      // can query Salesforce if the question requires it
-      const messages = [
-        { role: 'system', content: DEFAULT_SYSTEM_CONTENT },
-        { role: 'user', content: event.text },
-      ];
 
-      const responseContent = await runWithTools(messages);
-      await say({ text: responseContent });
-    } catch (error) {
-      console.error('Error handling app_mention:', error);
-      await say({ text: 'Sorry, something went wrong processing your request.' });
-    }
+    const ctx = { client, userId: event.user, channelId: event.channel, contextChannelId: event.channel };
+    const messages = [
+      { role: 'system', content: buildSystemPrompt(ctx) },
+      ...history,
+      { role: 'user', content: event.text },
+    ];
+
+    const result = await runWithTools(messages, ctx);
+    await say({ ...(await buildReplyMessage(result, event.user)), thread_ts: threadTs });
+  } catch (error) {
+    logger.error('Error handling app_mention:', error);
+    await say({ text: 'Sorry, something went wrong processing your request.', thread_ts: threadTs });
   }
 });
 
+/**
+ * Greets a channel when Lori is added to it (via /invite or the join_channel tool).
+ */
+app.event('member_joined_channel', async ({ event, client, context, logger }) => {
+  if (event.user !== context.botUserId) return;
+  try {
+    await client.chat.postMessage({
+      channel: event.channel,
+      text:
+        "👋 Hi, I'm *Lori*! Mention me with *@Lori AI* to search or edit Salesforce records, " +
+        'or ask me to summarize this channel.',
+    });
+  } catch (error) {
+    logger.error('Error greeting channel:', error);
+  }
+});
+
+/**
+ * Posts a short result note to the thread where an edit happened.
+ */
+async function postEditNote(client, { channel, threadTs, userId, text, ephemeral = false }) {
+  if (!channel) return client.chat.postMessage({ channel: userId, text });
+  if (ephemeral) return client.chat.postEphemeral({ channel, user: userId, thread_ts: threadTs, text });
+  return client.chat.postMessage({ channel, thread_ts: threadTs, text });
+}
+
+// Name field of an object (Name, CaseNumber, Subject, ...) — fetched so notes can show the record title
+function nameFieldOf(describe) {
+  return describe.fields.find(f => f.nameField)?.name || 'Id';
+}
+
+/**
+ * "✏️ Edit" button on a record card: opens a modal with the card's editable fields.
+ * A loading modal is opened first because trigger_id expires 3 seconds after the click.
+ */
+app.action('sf_edit_record', async ({ ack, body, client, action, logger }) => {
+  await ack();
+  const { o, id, f } = JSON.parse(action.value);
+
+  const { view } = await client.views.open({ trigger_id: body.trigger_id, view: buildLoadingModal() });
+
+  try {
+    const describe = await getDescribe(o);
+    const fields = pickEditableFields(describe, f);
+    if (fields.length === 0) {
+      await client.views.update({ view_id: view.id, view: buildLoadingModal('This record has no fields you can edit here.') });
+      return;
+    }
+
+    const record = await getRecord(o, id, [...new Set(['Id', nameFieldOf(describe), ...fields.map(m => m.name)])]);
+    await client.views.update({
+      view_id: view.id,
+      view: buildEditModal({
+        describe,
+        record,
+        fields,
+        privateMetadata: { o, id, ch: body.channel?.id, ts: body.message?.thread_ts || body.message?.ts },
+      }),
+    });
+  } catch (error) {
+    logger.error('Error opening edit modal:', error);
+    await client.views.update({ view_id: view.id, view: buildLoadingModal(`❌ Could not load the record: ${error.message}`) });
+  }
+});
+
+/**
+ * Edit modal submitted: re-reads the record, saves only the changed fields and reports in the thread.
+ */
+app.view('sf_edit_modal', async ({ ack, body, view, client, logger }) => {
+  await ack();
+  const { o, id, ch, ts } = JSON.parse(view.private_metadata);
+  const userId = body.user.id;
+
+  try {
+    const describe = await getDescribe(o);
+    const fieldNames = Object.keys(view.state.values)
+      .filter(k => k.startsWith('f:'))
+      .map(k => k.slice(2));
+    const current = await getRecord(o, id, [...new Set(['Id', nameFieldOf(describe), ...fieldNames])]);
+    const changes = parseEditSubmission(view.state.values, describe, current);
+
+    if (Object.keys(changes).length === 0) {
+      await postEditNote(client, { channel: ch, threadTs: ts, userId, ephemeral: true, text: 'No changes to save.' });
+      return;
+    }
+
+    await updateRecord(o, id, changes);
+    const lines = describeChanges(changes, current, describe).map(l => `• ${l.replace('\n', ': ')}`);
+    await postEditNote(client, {
+      channel: ch,
+      threadTs: ts,
+      userId,
+      text: `✅ <@${userId}> updated ${describe.label} *<${recordUrl(o, id)}|${recordTitle(current)}>*\n${lines.join('\n')}`,
+    });
+  } catch (error) {
+    logger.error('Error saving record edit:', error);
+    await postEditNote(client, { channel: ch, threadTs: ts, userId, ephemeral: true, text: `❌ ${error.message}` });
+  }
+});
+
+/**
+ * Replaces the Save/Cancel buttons of an edit confirmation card with a status line.
+ */
+async function resolveEditCard(client, body, statusText) {
+  const blocks = body.message.blocks.map(block =>
+    block.block_id === body.actions[0].block_id
+      ? { type: 'context', elements: [{ type: 'mrkdwn', text: statusText }] }
+      : block
+  );
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, text: body.message.text, blocks });
+}
+
+/**
+ * Save / Cancel on an AI-proposed edit. Only the user who asked for the edit may resolve it.
+ */
+async function handleEditDecision({ ack, body, client, action, logger }, save) {
+  await ack();
+  const { o, id, c, u } = JSON.parse(action.value);
+  const userId = body.user.id;
+  const threadTs = body.message.thread_ts || body.message.ts;
+
+  if (userId !== u) {
+    await client.chat.postEphemeral({
+      channel: body.channel.id,
+      user: userId,
+      thread_ts: threadTs,
+      text: `Only <@${u}> can confirm this edit.`,
+    });
+    return;
+  }
+
+  if (!save) {
+    await resolveEditCard(client, body, `🚫 Cancelled by <@${userId}>`);
+    return;
+  }
+
+  try {
+    await updateRecord(o, id, c);
+    await resolveEditCard(client, body, `✅ Saved to Salesforce by <@${userId}>`);
+  } catch (error) {
+    logger.error('Error saving confirmed edit:', error);
+    await client.chat.postEphemeral({ channel: body.channel.id, user: userId, thread_ts: threadTs, text: `❌ ${error.message}` });
+  }
+}
+
+app.action('sf_confirm_edit', args => handleEditDecision(args, true));
+app.action('sf_cancel_edit', args => handleEditDecision(args, false));
 
 app.command('/timesheet-lks', async ({ ack, body, client }) => {
   await ack();

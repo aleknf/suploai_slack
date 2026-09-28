@@ -53,16 +53,22 @@ function buildHeaders(token) {
   };
 }
 
+// Describe results rarely change — cache them in memory to avoid an extra round-trip per request
+const DESCRIBE_TTL_MS = 10 * 60 * 1000;
+const describeCache = new Map();
+
 /**
- * Fetches the field metadata for a given Salesforce object using the Describe API.
- * The AI uses this to discover available fields before constructing SOQL queries,
- * avoiding hardcoded schema assumptions.
+ * Fetches the raw Describe API result for an object, served from an in-memory cache when fresh.
+ * Used by both the AI-facing describeObject() and the Slack record renderer (labels, types, editability).
  *
- * @param {string} objectName - API name of the Salesforce object (e.g. "Contact", "Project__c")
- * @returns {Promise<Object>} Object containing name, label, and array of fields with their names/types/labels
+ * @param {string} objectName - API name of the Salesforce object
+ * @returns {Promise<Object>} Raw describe payload from Salesforce
  * @throws {Error} If the describe call fails or object does not exist
  */
-async function describeObject(objectName) {
+async function getDescribe(objectName) {
+  const cached = describeCache.get(objectName);
+  if (cached && Date.now() - cached.at < DESCRIBE_TTL_MS) return cached.data;
+
   const token = await getSalesforceToken();
   const url = `${sfUrl}/services/data/${SF_API_VERSION}/sobjects/${objectName}/describe`;
 
@@ -74,6 +80,21 @@ async function describeObject(objectName) {
   }
 
   const data = await response.json();
+  describeCache.set(objectName, { at: Date.now(), data });
+  return data;
+}
+
+/**
+ * Fetches the field metadata for a given Salesforce object using the Describe API.
+ * The AI uses this to discover available fields before constructing SOQL queries,
+ * avoiding hardcoded schema assumptions.
+ *
+ * @param {string} objectName - API name of the Salesforce object (e.g. "Contact", "Project__c")
+ * @returns {Promise<Object>} Object containing name, label, and array of fields with their names/types/labels
+ * @throws {Error} If the describe call fails or object does not exist
+ */
+async function describeObject(objectName) {
+  const data = await getDescribe(objectName);
 
   // Return only the fields relevant for query construction — avoids overwhelming the AI context
   return {
@@ -83,8 +104,13 @@ async function describeObject(objectName) {
       name: f.name,
       label: f.label,
       type: f.type,
+      updateable: f.updateable,
       // Include reference info so AI knows which objects a lookup field points to
       referenceTo: f.referenceTo || [],
+      // Active picklist values let the AI filter/update with valid values (e.g. StageName)
+      ...(f.type === 'picklist' || f.type === 'multipicklist'
+        ? { picklistValues: f.picklistValues.filter(v => v.active).slice(0, 40).map(v => v.value) }
+        : {}),
     })),
   };
 }
@@ -117,6 +143,17 @@ async function runSOQL(soql) {
   };
 }
 
+// Useful display fields per object for SOSL results (defaults to "Id, Name")
+const SOSL_RETURN_FIELDS = {
+  Account: 'Id, Name, Type, Industry, Owner.Name',
+  Contact: 'Id, Name, Title, Email, Phone, Account.Name',
+  Lead: 'Id, Name, Company, Status, Email',
+  Opportunity: 'Id, Name, StageName, Amount, CloseDate, Account.Name',
+  Case: 'Id, CaseNumber, Subject, Status, Priority',
+  Task: 'Id, Subject, Status, ActivityDate',
+  Event: 'Id, Subject, StartDateTime',
+};
+
 /**
  * Executes a SOSL (Salesforce Object Search Language) search across one or more objects.
  * SOSL is better than SOQL for keyword searches because it searches across all text fields
@@ -131,13 +168,16 @@ async function runSOQL(soql) {
 async function runSOSL(searchTerm, objectNames, limit = 10) {
   const token = await getSalesforceToken();
 
-  // Build the RETURNING clause — each object returns Id and Name by default
+  // Build the RETURNING clause — objects without a Name field return their own identifying fields
   const returningClause = objectNames
-    .map(obj => `${obj}(Id, Name)`)
+    .map(obj => `${obj}(${SOSL_RETURN_FIELDS[obj] || 'Id, Name'})`)
     .join(', ');
 
+  // SOSL reserved characters must be escaped inside FIND {...}
+  const escapedTerm = searchTerm.replace(/([?&|!{}[\]()^~*:\\"'+-])/g, '\\$1');
+
   // SOSL syntax: FIND {term} IN ALL FIELDS RETURNING Object1(...), Object2(...)
-  const sosl = `FIND {${searchTerm}} IN ALL FIELDS RETURNING ${returningClause} LIMIT ${limit}`;
+  const sosl = `FIND {${escapedTerm}} IN ALL FIELDS RETURNING ${returningClause} LIMIT ${limit}`;
   const url = `${sfUrl}/services/data/${SF_API_VERSION}/search?q=${encodeURIComponent(sosl)}`;
 
   const response = await fetch(url, { headers: buildHeaders(token) });
@@ -184,6 +224,36 @@ async function getRecord(objectName, recordId, fields = []) {
   }
 
   return await response.json();
+}
+
+/**
+ * Updates fields on a single Salesforce record (PATCH). Salesforce returns 204 No Content on success.
+ *
+ * @param {string} objectName - API name of the Salesforce object
+ * @param {string} recordId - 15 or 18-character Salesforce record Id
+ * @param {Object} fields - Map of field API name → new value (null clears the field)
+ * @returns {Promise<void>}
+ * @throws {Error} If validation fails or access is denied
+ */
+async function updateRecord(objectName, recordId, fields) {
+  const token = await getSalesforceToken();
+  const url = `${sfUrl}/services/data/${SF_API_VERSION}/sobjects/${objectName}/${recordId}`;
+
+  const response = await fetch(url, {
+    method: 'PATCH',
+    headers: buildHeaders(token),
+    body: JSON.stringify(fields),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    // Salesforce errors come as [{ message, errorCode, fields }] — surface the message only
+    let message = errorText;
+    try {
+      message = JSON.parse(errorText).map(e => e.message).join('; ');
+    } catch (_) {}
+    throw new Error(`Update failed for ${objectName}/${recordId}: ${message}`);
+  }
 }
 
 /**
@@ -327,8 +397,11 @@ async function queryCases({ status, priority, accountName, contactName, subjectK
 }
 
 module.exports = {
+  sfUrl,
   getSalesforceToken,
+  getDescribe,
   describeObject,
+  updateRecord,
   runSOQL,
   runSOSL,
   getRecord,

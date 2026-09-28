@@ -102,7 +102,12 @@
                 "im:write",
                 "users:read",
                 "users:read.email",
-                "users.profile:read"
+                "users.profile:read",
+                "channels:join",
+                "channels:read",
+                "groups:read",
+                "mpim:history",
+                "mpim:read"
             ]
         },
         "pkce_enabled": false
@@ -113,7 +118,8 @@
                 "assistant_thread_context_changed",
                 "assistant_thread_started",
                 "message.im",
-                "app_mention"
+                "app_mention",
+                "member_joined_channel"
             ]
         },
         "interactivity": {
