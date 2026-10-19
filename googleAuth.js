@@ -11,7 +11,7 @@
  *   HTTP endpoint). Put HTTPS in front of it (Caddy/nginx) and register the URL as GOOGLE_REDIRECT_URI.
  *
  * Env: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, GOOGLE_TOKEN_KEY (64 hex chars),
- *      optional GOOGLE_ALLOWED_DOMAIN, GOOGLE_TOKEN_STORE, OAUTH_PORT.
+ *      optional GOOGLE_ALLOWED_DOMAIN, GOOGLE_TOKEN_STORE, OAUTH_PORT, OAUTH_HOST (default 127.0.0.1).
  */
 
 const crypto = require('node:crypto');
@@ -317,7 +317,9 @@ function startOAuthServer({ client, logger = console }) {
     }
   });
 
-  server.listen(port, () => logger.info?.(`Google OAuth callback listening on :${port}${callbackPath}`));
+  // Localhost by default: the reverse proxy (Caddy/nginx) on the same machine is the only public entry point
+  const host = process.env.OAUTH_HOST || '127.0.0.1';
+  server.listen(port, host, () => logger.info?.(`Google OAuth callback listening on ${host}:${port}${callbackPath}`));
   return server;
 }
 
