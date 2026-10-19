@@ -47,6 +47,10 @@ function toolLabel(toolName, args = {}) {
       return 'Menyiapkan perubahan data';
     case 'log_activity':
       return 'Mencatat aktivitas ke Salesforce';
+    case 'read_file':
+      return 'Membaca file dari Google Drive';
+    case 'disconnect_google_drive':
+      return 'Memutuskan Google Drive';
     case 'read_channel_history':
       return 'Membaca pesan channel';
     case 'join_channel':
