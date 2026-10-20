@@ -179,4 +179,4 @@ async function executeSlackTool(toolName, args, ctx) {
   }
 }
 
-module.exports = { SLACK_TOOLS, SLACK_TOOL_NAMES, executeSlackTool };
+module.exports = { SLACK_TOOLS, SLACK_TOOL_NAMES, executeSlackTool, resolveChannelId, isChannelMember, getUserName };

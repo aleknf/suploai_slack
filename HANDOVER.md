@@ -27,6 +27,8 @@ Slack app "Lori AI" (LangitKreasi Orchestrated Reasoning Intelligence) untuk LKS
 | `activityBlocks.js` | Kartu "Aktivitas dicatat" + Undo |
 | `fileTools.js` | Tool `read_file` (link Google Drive/Docs/Sheets/Slides → teks) dan `disconnect_google_drive`; routing per tipe file |
 | `googleAuth.js` | OAuth Google per user Slack: state bertanda tangan, token terenkripsi (AES-256-GCM, `data/google-tokens.json`), refresh, server callback HTTP |
+| `channelTools.js` | Tool untuk isi channel: `get_channel_resources`, `read_canvas`, `edit_canvas`, `read_list`, `edit_list`, `read_slack_file`; `applyPending` menjalankan tulis yang sudah dikonfirmasi |
+| `channelBlocks.js` / `pending.js` | Kartu konfirmasi Save/Cancel untuk canvas/list; penyimpanan permintaan tertunda di memori (30 menit, hilang saat restart) |
 | `progress.js` | Animasi membaca/berpikir (status Assistant; placeholder + reaksi 👀/✅ di channel) |
 | `manifest.json` | Scope, event, slash command |
 
@@ -45,6 +47,14 @@ Slack app "Lori AI" (LangitKreasi Orchestrated Reasoning Intelligence) untuk LKS
 - Env baru: GOOGLE_CLIENT_ID/SECRET/REDIRECT_URI/TOKEN_KEY (+ opsional GOOGLE_ALLOWED_DOMAIN, OAUTH_PORT), lihat `.env.sample`. Server callback butuh URL HTTPS publik (reverse proxy ke port OAUTH_PORT). Server: `pip install "markitdown[pdf,docx,pptx,xlsx]"` (Python 3.10+).
 - Diuji hanya dengan mock Google/OpenAI + dokumen sungguhan lokal; belum dengan Google Cloud project dan Slack asli.
 - Risiko: isi file bisa memuat prompt injection. System prompt melarang mengikuti instruksi di file; `update_record` tetap perlu konfirmasi, tetapi `log_activity` langsung menyimpan.
+
+## Canvas, List, dan file di channel (2026-10-20)
+- Contoh channel uji: `test-channel-proj` (private, dari template; ada canvas "Project overview", List "Project tracker", Lori sudah anggota).
+- Baca: canvas (markdown via `canvases.getContent`), List (skema kolom + baris via `slackLists.items.list` `include_list`), file Slack (diunduh dengan token bot lalu lewat `readFileBuffer` di fileTools: MarkItDown/PDF teks-dulu), chat (`read_channel_history`).
+- Tulis: `edit_canvas` (append/prepend/insert/replace/delete section/replace_all/rename) dan `edit_list` (add_row/update_row) **selalu lewat kartu Save/Cancel**; hanya peminta yang bisa Save. **File tidak bisa diubah atau diunggah** (keputusan Alek: file hanya baca).
+- Akses dibatasi ke resource milik channel tempat diminta; channel private hanya bila peminta anggota. Lori bekerja dengan identitas bot, jadi batas ini menggantikan izin per user Slack.
+- Scope bot baru di manifest: `canvases:read`, `lists:read`, `lists:write` (manifest harus di-update + reinstall; sebelum itu tool membalas "Lori belum punya izin ...").
+- **Belum terverifikasi di Slack asli**: bentuk respons `slackLists.items.list` (skema dibaca dari `list.list_metadata.schema`, dengan cadangan `list.schema`), kolom bertipe rating/email/telepon belum didukung, dan cara bot mendapat akses ke sebuah List (dokumentasi Slack tidak menjelaskan).
 
 ## Status & hal yang belum terverifikasi
 - **Semua fitur diuji hanya dengan mock** (Slack/Salesforce/OpenAI tiruan) + sintaks + lint. Belum ada uji di Slack dan org Salesforce asli.
