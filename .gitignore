@@ -4,3 +4,6 @@
 .env*
 !.env.sample
 .env
+
+# AI handover notes (local only)
+/HANDOVER.md
