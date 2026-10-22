@@ -413,8 +413,23 @@ function toHistoryMessage(m) {
   const content = m.bot_id && m.blocks?.length ? blocksToText(m.blocks) : m.text;
   return {
     role: m.bot_id ? 'assistant' : 'user',
-    content: (content || '').slice(0, 4000),
+    content: [content, attachmentsToText(m.attachments)].filter(Boolean).join('\n').slice(0, 4000),
   };
+}
+
+/**
+ * Text of message attachments (workflow cards, link unfurls such as a List item), so the AI sees what the message
+ * shows: title, text and fields.
+ */
+function attachmentsToText(attachments = []) {
+  return attachments
+    .map(a =>
+      [a.title, a.text || a.fallback, ...(a.fields || []).map(f => `${f.title}: ${f.value}`), a.title_link || a.from_url]
+        .filter(Boolean)
+        .join(' | ')
+    )
+    .filter(Boolean)
+    .join('\n');
 }
 
 /**
@@ -455,6 +470,9 @@ Two kinds of projects — never mix them up:
 - For specific questions about a Slack project (e.g. "which tasks are overdue?", "what does the plan say?") read_list / read_canvas work too.
 
 Channel canvases, Lists and files:
+- Links in a project: get_links finds the links written in the channel canvas and in the List — all rows, or one row via row_id or a Slack List item URL like https://….slack.com/lists/…?record_id=Rec…. To summarize or answer from a document linked there: get_links, then read_file on the Google link(s) (at most 3 documents per request; if several are possible and the user did not say which, ask which).
+- In a thread, "ini", "this" or "doc-nya" means the thread's parent message and the item or link in it — not the whole channel. If the parent message has a Slack List item URL, use it with get_links (for its document) or read_list (for the row itself). Summarize the whole channel only when asked to.
+- A Slack List/canvas URL is not a Drive file: never pass it to read_file.
 - get_channel_resources shows the canvases, Lists and files of a channel (default: the current channel). read_canvas, read_list and read_slack_file read them; the chat itself is read with read_channel_history.
 - edit_canvas and edit_list never save directly: the user gets a Save/Cancel card, so do not ask for confirmation in text. Before editing, read first: read_canvas so section_text matches a real heading, read_list to learn column names, select options and row ids.
 - Files are read-only: you cannot change or upload files. If asked, say so and offer to put the content in a canvas or List instead.

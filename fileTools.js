@@ -24,6 +24,7 @@ const { promisify } = require('node:util');
 const fetch = require('node-fetch');
 const { OpenAI } = require('openai');
 const googleAuth = require('./googleAuth');
+const { parseSlackUrl } = require('./slackTools');
 const { htmlToText } = require('./salesforce');
 
 const execFileAsync = promisify(execFile);
@@ -375,7 +376,16 @@ async function readFile(args, ctx) {
   if (!googleAuth.isConfigured()) return { error: 'Integrasi Google Drive belum dikonfigurasi di server.' };
 
   const ref = parseGoogleUrl(args.url);
-  if (!ref) return { error: 'Itu bukan link Google Drive/Docs/Sheets/Slides yang dikenali.' };
+  if (!ref) {
+    if (parseSlackUrl(args.url)) {
+      return {
+        error:
+          'Itu link Slack (List/canvas/file), bukan file Google Drive. Gunakan get_links untuk mengambil link dokumen ' +
+          'di dalamnya, lalu baca link Google-nya dengan read_file.',
+      };
+    }
+    return { error: 'Itu bukan link Google Drive/Docs/Sheets/Slides yang dikenali.' };
+  }
   if (ref.kind === 'folder') return { error: 'Link folder tidak didukung. Kirim link file-nya.' };
   if (ref.kind === 'forms') return { error: 'Google Forms tidak didukung.' };
 
