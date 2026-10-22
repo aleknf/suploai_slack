@@ -76,6 +76,8 @@ const LABELS = {
     overdue: 'Terlambat',
     soon: 'Jatuh tempo ≤7 hari',
     unassigned: 'Tanpa PIC',
+    blocked: 'Terhambat',
+    blockedLabel: 'terhambat',
     about: 'Tentang project',
     risks: 'Risiko Utama',
     attention: 'Perlu perhatian',
@@ -100,6 +102,8 @@ const LABELS = {
     overdue: 'Overdue',
     soon: 'Due in ≤7 days',
     unassigned: 'Unassigned',
+    blocked: 'Blocked',
+    blockedLabel: 'blocked',
     about: 'About the project',
     risks: 'Key Risks',
     attention: 'Needs attention',
@@ -126,7 +130,12 @@ function progressBar(pct) {
 }
 
 function attentionLine(task, L, kind) {
-  const when = kind === 'overdue' ? `⚠️ ${L.late(task.daysLate)}` : `${formatValue(task.due, 'date')} (${L.dueSoonLabel})`;
+  const when =
+    kind === 'overdue'
+      ? `⚠️ ${L.late(task.daysLate)}`
+      : kind === 'blocked'
+        ? `🚧 ${L.blockedLabel}`
+        : `${formatValue(task.due, 'date')} (${L.dueSoonLabel})`;
   return `• *${esc(task.task)}* — ${when} · ${task.owner ? esc(task.owner) : `_${L.noOwner}_`}`;
 }
 
@@ -165,6 +174,7 @@ function buildProjectStatusBlocks(review, data) {
           kpi(L.overdue, s.overdue > 0 ? `⚠️ ${s.overdue}` : '0'),
           kpi(L.soon, String(s.dueIn7Days)),
           kpi(L.unassigned, String(s.unassigned)),
+          ...(s.blocked > 0 ? [kpi(L.blocked, `🚧 ${s.blocked}`)] : []),
         ],
       }
     );
@@ -185,13 +195,18 @@ function buildProjectStatusBlocks(review, data) {
   }
 
   // Tasks needing attention come straight from the List, so names, dates and owners are exact
-  const lines = [
-    ...(attention?.overdue || []).map(t => attentionLine(t, L, 'overdue')),
-    ...(attention?.dueSoon || []).map(t => attentionLine(t, L, 'soon')),
-  ];
+  const listed = new Set();
+  const lines = [];
+  for (const [kind, tasks] of [['overdue', attention?.overdue], ['soon', attention?.dueSoon], ['blocked', attention?.blocked]]) {
+    for (const t of tasks || []) {
+      if (listed.has(t.task)) continue; // a blocked task that is also overdue is shown once
+      listed.add(t.task);
+      lines.push(attentionLine(t, L, kind));
+    }
+  }
   if (lines.length) {
     const shown = lines.slice(0, 8);
-    const extra = s.overdue + s.dueIn7Days - shown.length;
+    const extra = s.overdue + s.dueIn7Days + (s.blocked || 0) - shown.length;
     blocks.push({
       type: 'section',
       text: {
