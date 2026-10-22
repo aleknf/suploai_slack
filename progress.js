@@ -49,6 +49,8 @@ function toolLabel(toolName, args = {}) {
       return 'Mencatat aktivitas ke Salesforce';
     case 'read_file':
       return 'Membaca file dari Google Drive';
+    case 'get_file_changes':
+      return 'Membandingkan revisi dokumen';
     case 'get_links':
       return 'Mencari link dokumen di canvas dan List';
     case 'get_project_status':
