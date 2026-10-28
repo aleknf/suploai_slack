@@ -108,7 +108,10 @@
                 "groups:read",
                 "mpim:history",
                 "mpim:read",
-                "reactions:write"
+                "reactions:write",
+                "canvases:read",
+                "lists:read",
+                "lists:write"
             ]
         },
         "pkce_enabled": false

@@ -47,6 +47,28 @@ function toolLabel(toolName, args = {}) {
       return 'Menyiapkan perubahan data';
     case 'log_activity':
       return 'Mencatat aktivitas ke Salesforce';
+    case 'read_file':
+      return 'Membaca file dari Google Drive';
+    case 'get_file_changes':
+      return 'Membandingkan revisi dokumen';
+    case 'get_links':
+      return 'Mencari link dokumen di canvas dan List';
+    case 'get_project_status':
+      return 'Membaca canvas dan List project';
+    case 'get_channel_resources':
+      return 'Melihat canvas, list, dan file di channel';
+    case 'read_canvas':
+      return 'Membaca canvas';
+    case 'edit_canvas':
+      return 'Menyiapkan perubahan canvas';
+    case 'read_list':
+      return 'Membaca list';
+    case 'edit_list':
+      return 'Menyiapkan perubahan list';
+    case 'read_slack_file':
+      return 'Membaca file di Slack';
+    case 'disconnect_google_drive':
+      return 'Memutuskan Google Drive';
     case 'read_channel_history':
       return 'Membaca pesan channel';
     case 'join_channel':

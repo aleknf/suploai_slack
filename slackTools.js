@@ -179,4 +179,35 @@ async function executeSlackTool(toolName, args, ctx) {
   }
 }
 
-module.exports = { SLACK_TOOLS, SLACK_TOOL_NAMES, executeSlackTool };
+/**
+ * Parses a link to a Slack List, canvas or file (also Slack's <url|label> form).
+ *
+ * @param {string} raw - Link text, e.g. https://acme.slack.com/lists/T123/F456?record_id=Rec789
+ * @returns {{kind: 'list'|'canvas'|'file', fileId: string, recordId?: string}|null}
+ */
+function parseSlackUrl(raw) {
+  let url;
+  try {
+    url = new URL(String(raw).trim().replace(/^<|>$/g, '').split('|')[0]);
+  } catch (_) {
+    return null;
+  }
+  if (!/(^|\.)slack\.com$/.test(url.hostname)) return null;
+  const match = url.pathname.match(/^\/(lists|docs|files)\/[^/]+\/(F[A-Z0-9]+)/);
+  if (!match) return null;
+  return {
+    kind: { lists: 'list', docs: 'canvas', files: 'file' }[match[1]],
+    fileId: match[2],
+    recordId: url.searchParams.get('record_id') || undefined,
+  };
+}
+
+module.exports = {
+  SLACK_TOOLS,
+  SLACK_TOOL_NAMES,
+  executeSlackTool,
+  resolveChannelId,
+  isChannelMember,
+  getUserName,
+  parseSlackUrl,
+};

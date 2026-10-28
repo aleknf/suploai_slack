@@ -1,5 +1,9 @@
 /node_modules
+/data
 .DS_Store
 .env*
 !.env.sample
 .env
+
+# AI handover notes (local only)
+/HANDOVER.md
